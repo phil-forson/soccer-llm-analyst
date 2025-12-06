@@ -15,7 +15,7 @@ load_dotenv()
 # =============================================================================
 
 # Default OpenAI model (can be changed to gpt-4, gpt-4-turbo, etc.)
-DEFAULT_LLM_MODEL = "gpt-4.1-mini"
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
 
 # =============================================================================
