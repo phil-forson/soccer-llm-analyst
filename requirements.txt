@@ -1,0 +1,25 @@
+# HTTP requests
+requests>=2.31.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Embeddings for RAG
+sentence-transformers>=2.2.0
+
+# Vector database for RAG
+chromadb>=0.4.0
+
+# OpenAI API client (LLM)
+openai>=1.0.0
+
+# Web search (DuckDuckGo)
+ddgs>=7.0.0
+
+# YouTube video metadata and transcripts
+yt-dlp>=2024.1.0
+youtube-transcript-api>=0.6.0
+
+# Testing (optional)
+pytest>=7.0.0
+
