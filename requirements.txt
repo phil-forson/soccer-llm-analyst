@@ -23,3 +23,8 @@ youtube-transcript-api>=0.6.0
 # Testing (optional)
 pytest>=7.0.0
 
+# FastAPI for REST API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+

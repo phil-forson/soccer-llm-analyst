@@ -2438,14 +2438,17 @@ Description: {description[:500] if description else "N/A"}
 === VALIDATION TASK ===
 Determine if this YouTube video is showing highlights for the SAME match described above.
 
-Check for:
-1. Do the team names match? (both teams should be the same)
-2. Does the date/time context match? (same match, not an older game)
-3. Does the score match if shown in title? (e.g., "3-0" should match "{score}")
-4. Is it from a DIFFERENT match between the same teams? (reject if wrong date)
+CRITICAL CHECKS:
+1. **Team Names Match**: Both teams should be the same (exact match or clear variations)
+2. **Home/Away Order**: The video title should show "{home_team}" as home team and "{away_team}" as away team.
+   - If video shows "{away_team} vs {home_team}" or "{away_team} v {home_team}", that's OK (order can be reversed in titles)
+   - But if video shows a DIFFERENT team as home, it's INVALID
+3. **Date/Time Context**: Same match, not an older game between these teams
+4. **Score Match**: If score shown in title (e.g., "3-0"), it should match "{score}"
+5. **Different Match**: Reject if it's from a PREVIOUS match between the same teams
 
-CRITICAL: A video from a PREVIOUS match between these teams is INVALID.
-For example, if we're looking for the Dec 2025 match, a video from Nov 2024 is INVALID.
+IMPORTANT: Team order matters! "{home_team} vs {away_team}" means {home_team} is HOME.
+If the video title clearly shows a different team as home, it's INVALID.
 
 Respond with EXACTLY this format:
 VERDICT: VALID or INVALID
@@ -2675,21 +2678,47 @@ def search_and_display_highlights_with_metadata(
         year = datetime.now().year
     
     # Build targeted search queries for trusted channels
+    # Competition-aware source selection
+    competition = match_metadata.get("competition", "").lower() if match_metadata else ""
+    is_ucl = "champions league" in competition or "ucl" in competition
+    is_premier_league = "premier league" in competition or "epl" in competition
+    
     match_str = f"{home_team} vs {away_team}" if away_team else home_team
+    match_str_reverse = f"{away_team} vs {home_team}" if away_team else home_team
     
     queries = []
     
-    # NBC Sports with date (most reliable)
-    if nbc_date:
-        queries.append(f"{match_str} NBC Sports {nbc_date}")
-        queries.append(f"{away_team} vs {home_team} NBC Sports {nbc_date}")
+    # Competition-specific source prioritization
+    if is_ucl:
+        # Champions League: Prioritize CBS Sports Golazo, UEFA, official clubs
+        if nbc_date:
+            queries.append(f"{match_str} CBS Sports Golazo {nbc_date}")
+            queries.append(f"{match_str_reverse} CBS Sports Golazo {nbc_date}")
+        queries.append(f"{match_str} CBS Sports Golazo highlights {month_name} {year}")
+        queries.append(f"{match_str} UEFA Champions League highlights {year}")
+        queries.append(f"{match_str} Champions League highlights {year}")
+        # Also check NBC Sports (they cover UCL too)
+        if nbc_date:
+            queries.append(f"{match_str} NBC Sports {nbc_date}")
+        queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
+    elif is_premier_league:
+        # Premier League: Prioritize NBC Sports, Premier League official, official clubs
+        if nbc_date:
+            queries.append(f"{match_str} NBC Sports {nbc_date}")
+            queries.append(f"{match_str_reverse} NBC Sports {nbc_date}")
+        queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
+        queries.append(f"{match_str} Premier League highlights {year}")
+        queries.append(f"{match_str} Premier League official highlights {year}")
+    else:
+        # Other competitions: Use all trusted sources
+        if nbc_date:
+            queries.append(f"{match_str} NBC Sports {nbc_date}")
+            queries.append(f"{match_str_reverse} NBC Sports {nbc_date}")
+        queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
+        queries.append(f"{match_str} CBS Sports Golazo highlights {year}")
+        queries.append(f"{match_str} ESPN FC highlights {year}")
     
-    # Trusted channels
-    queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
-    queries.append(f"{match_str} CBS Sports Golazo highlights {year}")
-    queries.append(f"{match_str} ESPN FC highlights {year}")
-    
-    # Official club channels
+    # Official club channels (always include)
     if home_team:
         queries.append(f"{home_team} official highlights vs {away_team} {month_name} {year}")
     if away_team:

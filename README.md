@@ -1,6 +1,6 @@
-# ⚽ Soccer Match LLM Analyst (CLI)
+# ⚽ Soccer Match LLM Analyst
 
-A terminal-based application that helps you find football match highlights and information using AI-powered search.
+An intelligent RAG-based football/soccer information system with both CLI and REST API interfaces.
 
 ## Features
 
@@ -15,6 +15,8 @@ A terminal-based application that helps you find football match highlights and i
 - **Web Search**: `ddgs` (DuckDuckGo - no API key needed)
 - **YouTube Search**: DuckDuckGo video search + validation
 - **LLM**: OpenAI API (gpt-4.1-mini by default)
+- **RAG**: SentenceTransformers + ChromaDB for intelligent retrieval
+- **API**: FastAPI for REST endpoints
 
 ## Setup
 
@@ -36,7 +38,36 @@ OPENAI_API_KEY=your_openai_key_here
 
 ## Usage
 
-### Run the CLI
+### Option 1: REST API (For Frontend Integration)
+
+Start the API server:
+
+```bash
+# Using the run script
+python run_api.py
+
+# Or directly with uvicorn
+uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The API will be available at `http://localhost:8000`
+
+- **API Documentation**: `http://localhost:8000/docs` (Swagger UI)
+- **ReDoc**: `http://localhost:8000/redoc`
+
+See [API_DOCS.md](API_DOCS.md) for detailed API documentation.
+
+**Example API Request:**
+```bash
+curl -X POST "http://localhost:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What was the score of Liverpool vs Sunderland?"}'
+```
+
+**Example Frontend:**
+See `example_frontend.html` for a complete frontend example.
+
+### Option 2: CLI (Terminal Interface)
 
 ```bash
 python -m src.cli
@@ -110,16 +141,22 @@ soccer-llm-analyst/
 ├── src/
 │   ├── __init__.py
 │   ├── config.py              # Configuration and env var helpers
-│   ├── web_search_agent.py    # Web search agent (DuckDuckGo + LLM)
-│   ├── youtube_search_agent.py # YouTube highlight finder
+│   ├── query_parser_agent.py  # LLM-based query parser
+│   ├── web_search_agent.py    # Web search with RAG
+│   ├── youtube_search_agent.py # YouTube highlight finder with RAG validation
 │   ├── embeddings_store.py    # Vector store (ChromaDB)
 │   ├── qa.py                  # Q&A logic (RAG + LLM)
-│   └── cli.py                 # Command-line interface
+│   ├── cli.py                 # Command-line interface
+│   └── api.py                 # REST API endpoints (FastAPI)
 ├── tests/
 │   ├── __init__.py
 │   └── test_chunking.py       # Unit tests
 ├── .env                       # Your API keys (not in git)
 ├── requirements.txt
+├── run_api.py                 # API server startup script
+├── example_frontend.html       # Example frontend integration
+├── API_DOCS.md                # API documentation
+├── RAG_USAGE.md               # RAG implementation details
 └── README.md
 ```
 
