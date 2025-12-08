@@ -7,16 +7,21 @@ The Soccer LLM Analyst uses a **chained agent architecture** where each agent re
 ```
 User Query
     ↓
-Query Parser Agent (LLM)
+Query Parser Agent (LLM) - Parses query ONCE, extracts intent, teams, date
     ↓
-Web Search Agent (RAG)
+Web Search Agent (RAG) - Uses parsed data, searches web, extracts match metadata
     ↓
-Game Analyst Agent (LLM)
+Game Analyst Agent (LLM) - Uses web search results, analyzes match
     ↓
-Highlights Agent (RAG Validation)
+Highlights Agent (RAG Validation) - Uses parsed data + web results, validates videos
     ↓
 Response
 ```
+
+**IMPORTANT**: Each agent receives parsed data from the previous agent. The YouTube search agent does NOT parse queries itself - it receives `home_team`, `away_team`, `match_date` from the query parser. This ensures:
+- No duplicate parsing (saves API credits)
+- Consistent data across agents
+- Proper agent chain flow
 
 ## Agent Chain Flow
 

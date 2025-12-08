@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSE Test - Soccer LLM Analyst</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .input-section {
+            margin-bottom: 30px;
+        }
+        input[type="text"] {
+            width: 70%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-left: 10px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .thinking-section {
+            margin-top: 30px;
+            min-height: 200px;
+            max-height: 500px;
+            overflow-y: auto;
+            border: 2px solid #e0e0e0;
+            border-radius: 5px;
+            padding: 20px;
+            background: #fafafa;
+        }
+        .thinking-message {
+            margin-bottom: 15px;
+            padding: 12px;
+            background: white;
+            border-left: 4px solid #007bff;
+            border-radius: 4px;
+            animation: fadeIn 0.3s;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .stage-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            background: #007bff;
+            color: white;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .status-starting { border-left-color: #ffc107; }
+        .status-processing { border-left-color: #17a2b8; }
+        .status-complete { border-left-color: #28a745; }
+        .status-error { border-left-color: #dc3545; }
+        .result-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #e8f5e9;
+            border-radius: 5px;
+            display: none;
+        }
+        .result-section.show {
+            display: block;
+        }
+        .error {
+            color: #dc3545;
+            background: #f8d7da;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+        .timestamp {
+            font-size: 11px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚽ Soccer LLM Analyst - SSE Test</h1>
+        
+        <div class="input-section">
+            <input type="text" id="queryInput" placeholder="Enter your query (e.g., 'Liverpool vs Sunderland score')" />
+            <button id="submitBtn" onclick="sendQuery()">Send Query</button>
+            <button id="stopBtn" onclick="stopStream()" disabled>Stop</button>
+        </div>
+        
+        <div id="thinkingSection" class="thinking-section"></div>
+        
+        <div id="resultSection" class="result-section">
+            <h2>Result</h2>
+            <pre id="resultContent"></pre>
+        </div>
+        
+        <div id="errorSection" class="error" style="display: none;"></div>
+    </div>
+
+    <script>
+        let abortController = null;
+        let buffer = '';
+
+        let eventSource = null;
+
+        function sendQuery() {
+            const query = document.getElementById('queryInput').value.trim();
+            if (!query) {
+                alert('Please enter a query');
+                return;
+            }
+
+            // Clear previous results
+            document.getElementById('thinkingSection').innerHTML = '';
+            document.getElementById('resultSection').classList.remove('show');
+            document.getElementById('errorSection').style.display = 'none';
+            
+            // Disable submit button
+            document.getElementById('submitBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+
+            // Close existing connection if any
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            // Use native EventSource API with GET endpoint
+            const encodedQuery = encodeURIComponent(query);
+            const url = `http://localhost:8000/query/stream?query=${encodedQuery}&include_highlights=true`;
+            
+            eventSource = new EventSource(url);
+
+            // Handle messages
+            eventSource.onmessage = function(event) {
+                const data = event.data;
+                
+                if (data === '[DONE]') {
+                    console.log('Stream finished');
+                    eventSource.close();
+                    document.getElementById('submitBtn').disabled = false;
+                    document.getElementById('stopBtn').disabled = true;
+                    return;
+                }
+
+                try {
+                    const parsed = JSON.parse(data);
+                    handleMessage(parsed);
+                } catch (e) {
+                    console.error('Error parsing message:', e, 'Data:', data);
+                }
+            };
+
+            // Handle errors
+            eventSource.onerror = function(error) {
+                console.error('EventSource error:', error);
+                showError('Connection error. Please try again.');
+                eventSource.close();
+                document.getElementById('submitBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+            };
+
+            // Handle open
+            eventSource.onopen = function() {
+                console.log('EventSource connection opened');
+            };
+        }
+
+        function handleMessage(parsed) {
+            console.log('Received message:', parsed);
+
+            // Check if it's a thinking message
+            if (parsed.stage) {
+                addThinkingMessage(
+                    parsed.stage,
+                    parsed.message,
+                    parsed.status,
+                    parsed.data
+                );
+            } else if (parsed.type === 'result') {
+                // Final result
+                showResult(parsed.data);
+            }
+        }
+
+        function addThinkingMessage(stage, message, status, data = {}) {
+            const section = document.getElementById('thinkingSection');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `thinking-message status-${status}`;
+            
+            const timestamp = new Date().toLocaleTimeString();
+            
+            messageDiv.innerHTML = `
+                <span class="stage-badge">${stage.toUpperCase()}</span>
+                <strong>${status.toUpperCase()}</strong>
+                <p>${message}</p>
+                ${data && Object.keys(data).length > 0 ? `<pre style="font-size: 11px; margin-top: 5px;">${JSON.stringify(data, null, 2)}</pre>` : ''}
+                <div class="timestamp">${timestamp}</div>
+            `;
+            
+            section.appendChild(messageDiv);
+            // Auto-scroll to bottom
+            section.scrollTop = section.scrollHeight;
+        }
+
+        function showResult(data) {
+            const section = document.getElementById('resultSection');
+            const content = document.getElementById('resultContent');
+            content.textContent = JSON.stringify(data, null, 2);
+            section.classList.add('show');
+        }
+
+        function showError(message) {
+            const errorSection = document.getElementById('errorSection');
+            errorSection.textContent = message;
+            errorSection.style.display = 'block';
+        }
+
+        function stopStream() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+                document.getElementById('submitBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+                addThinkingMessage('info', 'Stream stopped by user', 'complete');
+            }
+        }
+
+        // Allow Enter key to submit
+        document.getElementById('queryInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendQuery();
+            }
+        });
+    </script>
+</body>
+</html>
+

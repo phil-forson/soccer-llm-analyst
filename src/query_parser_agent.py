@@ -304,6 +304,23 @@ Return ONLY the JSON object."""
         parsed.setdefault("summary_focus", "key information")
         parsed.setdefault("is_relevant", True)
         parsed.setdefault("validation_error", None)
+
+        # Post-process single-team queries so search is anchored on the latest result
+        teams = parsed.get("teams") or []
+        if len(teams) == 1:
+            team = teams[0]
+            current_month = today.strftime("%B %Y")
+            # Force a strong search query that will pull the latest result/opponent
+            parsed["search_query"] = f"{team} latest match result score {current_month}"
+            parsed["is_most_recent"] = True
+            # If date_context not provided, assume most recent
+            if not parsed.get("date_context"):
+                parsed["date_context"] = "most recent"
+
+        # If intent is match_result but no teams extracted, still bias the search toward a recent result
+        if parsed.get("intent") == QueryIntent.MATCH_RESULT and not parsed.get("teams"):
+            current_month = today.strftime("%B %Y")
+            parsed["search_query"] = f"{query} latest match result score {current_month}"
         
         # Log parsed result
         print(f"[QueryParser] Intent: {parsed['intent']}")

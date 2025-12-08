@@ -217,7 +217,8 @@ def handle_query(query: str):
         result, match_metadata = search_with_rag(
             query=enhanced_search_query,
             intent=intent,
-            original_query=query
+            original_query=query,
+            parsed_query=parsed
         )
         web_summary = result  # Store the summary for RAG validation
         print("─" * 50)

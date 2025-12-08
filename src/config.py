@@ -39,3 +39,13 @@ def get_openai_key() -> str:
             "Please add it to your .env file."
         )
     return key
+
+
+def get_youtube_api_key() -> str | None:
+    """
+    Retrieve the YouTube Data API key if available.
+    
+    Returns:
+        str | None: The API key, or None if not set (allows fallback).
+    """
+    return os.getenv("YOUTUBE_API_KEY")

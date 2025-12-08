@@ -535,7 +535,8 @@ async def _process_query_with_thinking(request: QueryRequest):
             result, match_metadata = search_with_rag(
                 query=search_query,
                 intent=intent,
-                original_query=request.query
+                original_query=request.query,
+                parsed_query=parsed
             )
             web_summary = result
             
@@ -931,7 +932,8 @@ async def query_endpoint(request: QueryRequest):
             result, match_metadata = search_with_rag(
                 query=search_query,
                 intent=intent,
-                original_query=request.query
+                original_query=request.query,
+                parsed_query=parsed
             )
             web_summary = result
         except Exception as e:
@@ -1032,7 +1034,8 @@ async def query_endpoint(request: QueryRequest):
         return QueryResponse(
             success=True,
             intent=intent,
-            summary=web_summary,
+            # Prefer comprehensive game analysis summary when available, otherwise fall back to web summary
+            summary=game_analysis_data.get("deep_analysis") if game_analysis_data and game_analysis_data.get("deep_analysis") else web_summary,
             match_metadata=match_meta,
             highlights=highlights,
             sources=sources,
@@ -1110,7 +1113,8 @@ async def analyze_match_endpoint(request: QueryRequest):
             web_summary, match_metadata = search_with_rag(
                 query=search_query,
                 intent=intent,
-                original_query=request.query
+                original_query=request.query,
+                parsed_query=parsed
             )
         except Exception as e:
             return GameAnalysisResponse(

@@ -5,13 +5,18 @@ Uses DuckDuckGo video search to find YouTube highlights (no API key required).
 Intelligently handles seasons, home/away teams, and date-specific searches.
 """
 
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
+import requests
 from openai import OpenAI
 
-from .config import get_openai_key, DEFAULT_LLM_MODEL
+from .config import get_openai_key, DEFAULT_LLM_MODEL, get_youtube_api_key
+
+# Suppress Hugging Face tokenizer warnings (they appear when yt-dlp forks processes)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Try to import RAG components (optional)
 RAG_EMBEDDINGS_AVAILABLE = False
@@ -205,8 +210,15 @@ def _get_openai_client() -> OpenAI:
 
 
 # =============================================================================
-# LLM-Based Natural Language Query Parser
+# YouTube Search Functions
 # =============================================================================
+
+# NOTE: Query parsing is now handled by the main query_parser_agent.py
+# This agent receives parsed data and does NOT parse queries itself.
+# This follows the agent chain architecture: Query Parser → Web Search → Game Analyst → Highlights
+
+# DEPRECATED: The following parsing functions are kept for backward compatibility
+# but should NOT be used. All parsing should go through query_parser_agent.py
 
 def _parse_query_with_llm(query: str) -> dict:
     """
@@ -674,6 +686,44 @@ def _is_top_priority_channel(publisher: str) -> bool:
     return _is_nbc_sports(publisher)
 
 
+def _parse_iso8601_duration(duration_iso: str) -> Optional[int]:
+    """
+    Parse an ISO8601 duration (e.g., PT12M34S) to seconds.
+    """
+    if not duration_iso or not duration_iso.startswith("P"):
+        return None
+    
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+)D)?"
+        r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?",
+        duration_iso
+    )
+    if not match:
+        return None
+    
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _format_seconds_hms(seconds: Optional[int]) -> str:
+    """
+    Format seconds into h:mm:ss or m:ss for readability.
+    """
+    if seconds is None:
+        return "Unknown"
+    
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def _parse_duration_to_seconds(duration_str: str) -> Optional[int]:
     """
     Parse a duration string to seconds.
@@ -694,6 +744,10 @@ def _parse_duration_to_seconds(duration_str: str) -> Optional[int]:
         return None
     
     try:
+        # ISO8601 duration (YouTube API format)
+        if duration_str.startswith("P"):
+            return _parse_iso8601_duration(duration_str)
+        
         # Clean the string
         duration_str = duration_str.strip()
         
@@ -910,18 +964,65 @@ def _calculate_video_relevance(video: dict, match_info: dict) -> float:
             score += 3
             break  # Only count once
     
-    # ========== CHANNEL TRUST (up to 50 points) ==========
-    # NBC Sports gets HIGHEST priority
-    if _is_nbc_sports(publisher):
-        score += 50  # Massive bonus for NBC Sports
-    # Official club channels also get high bonus
-    elif video.get("is_official_club"):
-        score += 45
-    elif video.get("is_tier1"):
-        score += 40
+    # ========== CHANNEL TRUST (up to 50 points) - Competition-based ==========
+    # Prioritize channels based on competition:
+    # - Premier League: NBC Sports (most reliable)
+    # - La Liga: ESPN or La Liga channel
+    # - Champions League: CBS Sports Golazo
+    # Give equal points to these channels with NBC, especially if not Premier League
+    
+    is_premier_league = competition and "premier league" in competition
+    is_la_liga = competition and ("la liga" in competition or "laliga" in competition)
+    is_champions_league = competition and ("champions league" in competition or "ucl" in competition)
+    
+    # Check for trusted channels
+    is_nbc = _is_nbc_sports(publisher)
+    is_cbs_golazo = "cbs sports golazo" in publisher or "golazo" in publisher
+    is_espn = "espn" in publisher or "espn fc" in publisher
+    is_la_liga_channel = "la liga" in publisher or "laliga" in publisher
+    is_official_club = video.get("is_official_club", False)
+    
+    # Competition-based channel scoring
+    if is_premier_league:
+        # Premier League: NBC Sports is most reliable
+        if is_nbc:
+            score += 50  # Massive bonus for NBC Sports in PL
+        elif is_official_club:
+            score += 45  # Official club channels also good
+        elif is_cbs_golazo or is_espn:
+            score += 30  # Other trusted channels get lower priority for PL
+    elif is_la_liga:
+        # La Liga: ESPN or La Liga channel are most reliable
+        if is_espn or is_la_liga_channel:
+            score += 50  # Equal to NBC for La Liga
+        elif is_nbc:
+            score += 40  # NBC still good but not primary
+        elif is_official_club:
+            score += 45  # Official club channels
+        elif is_cbs_golazo:
+            score += 30
+    elif is_champions_league:
+        # Champions League: CBS Sports Golazo is most reliable
+        if is_cbs_golazo:
+            score += 50  # Equal to NBC for UCL
+        elif is_nbc:
+            score += 40  # NBC still good but not primary
+        elif is_official_club:
+            score += 45  # Official club channels
+        elif is_espn:
+            score += 30
     else:
-        # No bonus for non-allowed sources (they'll be filtered anyway)
-        pass
+        # Other competitions: Give equal weight to all trusted channels
+        if is_nbc:
+            score += 50
+        elif is_cbs_golazo:
+            score += 50  # Equal to NBC
+        elif is_espn:
+            score += 50  # Equal to NBC
+        elif is_la_liga_channel:
+            score += 50  # Equal to NBC
+        elif is_official_club:
+            score += 45  # Official club channels
     
     # ========== HIGHLIGHT KEYWORDS (up to 15 points) ==========
     keyword_matches = 0
@@ -947,6 +1048,29 @@ def _calculate_video_relevance(video: dict, match_info: dict) -> float:
         elif duration_seconds > 2400:  # >40 min
             score -= 10  # Penalty for too long
     
+    # ========== UPLOAD DATE VALIDATION (CRITICAL - up to 100 points) ==========
+    # Use actual upload date from YouTube API if available
+    upload_date = video.get("upload_date")  # Should be fetched during search
+    match_date = match_info.get("date", "")
+    
+    if upload_date and match_date:
+        try:
+            upload_dt = datetime.strptime(upload_date, "%Y-%m-%d")
+            match_dt = datetime.strptime(match_date, "%Y-%m-%d")
+            day_diff = abs((upload_dt - match_dt).days)
+            
+            # HUGE bonus if upload date is within 5 days of match date
+            if day_diff <= 5:
+                score += 100  # MASSIVE bonus - this is the correct match
+            elif day_diff <= 10:
+                score += 50  # Good - within 10 days
+            elif day_diff <= 30:
+                score += 20  # Acceptable - within a month
+            else:
+                score -= 100  # HEAVY PENALTY - upload date too far from match date
+        except (ValueError, TypeError):
+            pass  # Invalid date format, skip upload date scoring
+    
     # ========== RECENCY BONUS/PENALTY (CRITICAL - up to 100 points) ==========
     # HEAVILY prioritize recent matches to avoid showing old highlights
     
@@ -959,32 +1083,33 @@ def _calculate_video_relevance(video: dict, match_info: dict) -> float:
         current_season_short = f"{current_year - 1}/{str(current_year)[2:]}"
     
     # Try to extract specific date from title (e.g., "11/30/2025" or "12/14/2024")
-    import re
-    date_match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', title_raw)
-    if date_match:
-        vid_month, vid_day, vid_year = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
-        video["has_specific_date"] = True
-        video["video_date"] = f"{vid_year}-{vid_month:02d}-{vid_day:02d}"
-        
-        # Calculate how recent this is - HUGE bonus for specific dates
-        if vid_year == current_year and vid_month == current_month:
-            score += 100  # This month - MASSIVE bonus
-        elif vid_year == current_year and vid_month >= current_month - 1:
-            score += 80  # Last month - huge bonus
-        elif vid_year == current_year:
-            score += 50  # This year with specific date
+    # Only use if upload_date not available
+    if not upload_date:
+        date_match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', title_raw)
+        if date_match:
+            vid_month, vid_day, vid_year = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
+            video["has_specific_date"] = True
+            video["video_date"] = f"{vid_year}-{vid_month:02d}-{vid_day:02d}"
+            
+            # Calculate how recent this is - HUGE bonus for specific dates
+            if vid_year == current_year and vid_month == current_month:
+                score += 100  # This month - MASSIVE bonus
+            elif vid_year == current_year and vid_month >= current_month - 1:
+                score += 80  # Last month - huge bonus
+            elif vid_year == current_year:
+                score += 50  # This year with specific date
+            else:
+                score -= 40  # Older year with specific date
         else:
-            score -= 40  # Older year with specific date
-    else:
-        video["has_specific_date"] = False
-        # No specific date - LOWER scores since we can't verify recency
-        # Prefer videos with explicit dates
-        if current_season_str in title_raw or current_season_short in title_raw:
-            score += 30  # Season mention without specific date
-        elif str(current_year) in title_raw:
-            score += 20  # Just year, no specific date - could be any match from that year
-        elif str(current_year - 1) in title_raw:
-            score += 5
+            video["has_specific_date"] = False
+            # No specific date - LOWER scores since we can't verify recency
+            # Prefer videos with explicit dates
+            if current_season_str in title_raw or current_season_short in title_raw:
+                score += 30  # Season mention without specific date
+            elif str(current_year) in title_raw:
+                score += 20  # Just year, no specific date - could be any match from that year
+            elif str(current_year - 1) in title_raw:
+                score += 5
     
     # HEAVY PENALTY for old matches (2023, 2022, etc.)
     old_years = ["2018", "2019", "2020", "2021", "2022", "2023", "2024"]
@@ -992,6 +1117,36 @@ def _calculate_video_relevance(video: dict, match_info: dict) -> float:
         if old_year in title_raw and str(current_year) not in title_raw:
             score -= 60  # Heavy penalty for old content
             break
+    
+    # ========== SCORE VALIDATION (CRITICAL - HEAVY PENALTY if wrong) ==========
+    # Extract score from title and compare with match metadata
+    # If score is in title and doesn't match, penalize heavily
+    match_score = match_info.get("score", "")  # Format: "X-Y" (home-away)
+    
+    if match_score and match_score != "Unknown" and match_score:
+        # Try to extract score from title (patterns like "3-1", "2-0", "won 3-1", "beat 2-0")
+        score_patterns = [
+            r'(\d+)[\s\-–—](\d+)',  # "3-1", "3 1", "3–1"
+            r'won\s+(\d+)[\s\-–—](\d+)',  # "won 3-1"
+            r'beat\s+.*?(\d+)[\s\-–—](\d+)',  # "beat team 3-1"
+            r'(\d+)[\s\-–—](\d+)\s+win',  # "3-1 win"
+        ]
+        
+        title_score = None
+        for pattern in score_patterns:
+            score_match = re.search(pattern, title_raw, re.IGNORECASE)
+            if score_match:
+                home_goals = int(score_match.group(1))
+                away_goals = int(score_match.group(2))
+                title_score = f"{home_goals}-{away_goals}"
+                break
+        
+        if title_score:
+            # Compare with match score
+            if title_score == match_score:
+                score += 50  # HUGE bonus for correct score
+            else:
+                score -= 200  # HEAVY PENALTY for wrong score - this is likely the wrong match
     
     # ========== LOW RELEVANCE PENALTIES (subtract up to 40 points) ==========
     for keyword in LOW_RELEVANCE_KEYWORDS:
@@ -1007,7 +1162,8 @@ def _calculate_video_relevance(video: dict, match_info: dict) -> float:
         score -= 50
     
     # Clamp score to valid range
-    return max(0.0, min(100.0, score))
+    score = max(0.0, min(100.0, score))
+    return score
 
 
 def _filter_and_rank_by_relevance(results: list[dict], match_info: dict) -> list[dict]:
@@ -1216,6 +1372,79 @@ def _fetch_video_description(video_id: str) -> Optional[str]:
         return None
 
 
+def _fetch_video_upload_date(video_id: str, show_debug: bool = True) -> Optional[str]:
+    """
+    Fetch the upload date of a YouTube video using yt-dlp.
+    
+    Args:
+        video_id: YouTube video ID.
+        show_debug: Whether to print debug information.
+        
+    Returns:
+        Upload date in YYYY-MM-DD format or None if failed.
+    """
+    try:
+        import yt_dlp
+        from datetime import datetime
+        
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'skip_download': True,
+        }
+        
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            upload_date = info.get('upload_date', '')
+            
+            if upload_date:
+                # Format: YYYYMMDD -> YYYY-MM-DD
+                if len(upload_date) == 8:
+                    formatted_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+                    if show_debug:
+                        print(f"[YouTubeDebug] 📅 Video {video_id[:8]}... uploaded on: {formatted_date}")
+                    return formatted_date
+                # Try parsing other formats
+                try:
+                    # Try ISO format
+                    dt = datetime.fromisoformat(upload_date.replace('Z', '+00:00'))
+                    formatted_date = dt.strftime('%Y-%m-%d')
+                    if show_debug:
+                        print(f"[YouTubeDebug] 📅 Video {video_id[:8]}... uploaded on: {formatted_date}")
+                    return formatted_date
+                except:
+                    pass
+            
+            # Try timestamp
+            timestamp = info.get('timestamp')
+            if timestamp:
+                try:
+                    dt = datetime.fromtimestamp(timestamp)
+                    return dt.strftime('%Y-%m-%d')
+                except:
+                    pass
+            
+            return None
+            
+    except ImportError:
+        if show_debug:
+            print("[YouTubeDebug] ⚠️ yt-dlp not installed. Run: pip install yt-dlp")
+        return None
+    except Exception as e:
+        error_msg = str(e)
+        # Only show error if it's not a "video unavailable" error (common, not critical)
+        if "Video unavailable" in error_msg or "removed by the uploader" in error_msg:
+            if show_debug:
+                print(f"[YouTubeDebug] ⚠️ Video {video_id[:8]}... unavailable or removed (skipping)")
+        else:
+            if show_debug:
+                print(f"[YouTubeDebug] ⚠️ Error fetching upload date for {video_id[:8]}...: {error_msg[:60]}")
+        return None
+
+
 def _fetch_video_transcript(video_id: str) -> Optional[str]:
     """
     Fetch the transcript/captions of a YouTube video.
@@ -1262,7 +1491,7 @@ def _fetch_video_transcript(video_id: str) -> Optional[str]:
 
 def _fetch_video_metadata(url: str) -> dict:
     """
-    Fetch full metadata for a YouTube video (description + transcript).
+    Fetch full metadata for a YouTube video (description + transcript + upload date).
     
     Args:
         url: YouTube video URL.
@@ -1271,19 +1500,22 @@ def _fetch_video_metadata(url: str) -> dict:
         dict with:
             - description: str (full video description)
             - transcript: str (video transcript/captions)
+            - upload_date: str (YYYY-MM-DD format)
             - video_id: str
     """
     video_id = _extract_video_id(url)
     
     if not video_id:
-        return {"description": "", "transcript": "", "video_id": None}
+        return {"description": "", "transcript": "", "upload_date": None, "video_id": None}
     
     description = _fetch_video_description(video_id) or ""
     transcript = _fetch_video_transcript(video_id) or ""
+    upload_date = _fetch_video_upload_date(video_id)
     
     return {
         "description": description,
         "transcript": transcript,
+        "upload_date": upload_date,
         "video_id": video_id,
     }
 
@@ -1615,34 +1847,350 @@ Respond with ONLY one word: REAL or SIMULATION"""
         }
 
 
-def _search_youtube_highlights(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
+def _search_youtube_api_highlights(query: str, max_results: int = MAX_RESULTS, match_info: dict | None = None) -> list[dict]:
     """
-    Search for YouTube highlight videos using DuckDuckGo video search.
+    Primary path: Use YouTube Data API for higher quality, channel-aware search.
     
-    Filters out:
-        - Videos longer than 1 hour (likely full matches or simulations)
-        - Simulation/video game content (FIFA, eFootball, etc.)
-        - Preview/prediction content
-        - Gaming channels
+    Falls back to DuckDuckGo when no API key is configured or API returns nothing.
+    """
+    api_key = get_youtube_api_key()
+    if not api_key:
+        print("[YouTubeAPI] YOUTUBE_API_KEY not set; skipping YouTube Data API")
+        return []
     
-    Prioritizes:
-        - TOP PRIORITY: Official clubs, Champions League, TNT Sports
-        - Trusted sports channels (NBC Sports, Sky Sports, etc.)
-        - Real match footage
+    try:
+        search_max = min(max_results * 5, 50)  # overfetch for filtering
+
+        # Build focused queries based on match context
+        home = (match_info or {}).get("home_team", "")
+        away = (match_info or {}).get("away_team", "")
+        score = (match_info or {}).get("score", "")
+        match_date = (match_info or {}).get("date", "")  # YYYY-MM-DD
+        competition_channels = [c for c in _channels_for_competition(match_info) if c]
+        # Preserve channel ordering (trust priority) while de-duplicating
+        raw_channel_ids = [c.get("id") for c in competition_channels if c.get("id")]
+        seen_channel_ids: set[str] = set()
+        known_channel_ids: list[str] = []
+        for cid in raw_channel_ids:
+            if cid in seen_channel_ids:
+                continue
+            seen_channel_ids.add(cid)
+            known_channel_ids.append(cid)
+
+        team_query = f"{home} vs {away} highlights".strip() if away else (home or "").strip()
+        team_score_query = ""
+        if home and away and score:
+            team_score_query = f"{home} {score} {away} highlights"
+        elif team_query:
+            team_score_query = team_query
+
+        # Always prefer team-based query; fall back to caller query only if we have nothing
+        q_value = team_score_query or team_query or query
+
+        # Primary params (keep date ordering for general searches)
+        params = {
+            "part": "snippet",
+            "type": "video",
+            "maxResults": search_max,
+            "q": q_value,
+            "order": "date",
+            "videoDuration": "medium",  # prefer 4-20min highlights
+            "key": api_key,
+        }
+        
+        def run_search(p: dict, label: str):
+            prepared = requests.Request("GET", "https://www.googleapis.com/youtube/v3/search", params=p).prepare()
+            print(f"[YouTubeAPI] {label} Searching q=\"{p.get('q', '')}\"")
+            print(f"[YouTubeAPI] {label} URL: {prepared.url}")
+            print(f"[YouTubeAPI] {label} Params: {p}")
+            resp_local = requests.Session().send(prepared, timeout=10)
+            if resp_local.status_code != 200:
+                print(f"[YouTubeAPI] {label} search error {resp_local.status_code}: {resp_local.text[:300]}")
+                return None
+            return resp_local.json()
+        print(f"[YouTubeAPI] Competition: {match_info.get('competition') if match_info else 'unknown'}, channel candidates: {[c['name'] for c in competition_channels]}")
+        
+        # Step 0: Primary general search (no channel scoping)
+        data = run_search(params, "Primary")
+        if data is None:
+            return []
+        items = data.get("items", [])
+
+        # Step 1b: If still empty, try team-only with match-date window
+        if not items and team_query and match_date:
+            print("[YouTubeAPI] Primary search returned 0 items; trying team-only with match date window")
+            date_start = f"{match_date}T00:00:00Z"
+            date_end = f"{match_date}T23:59:59Z"
+
+            params_date = params.copy()
+            params_date["q"] = team_query
+            params_date["order"] = "relevance"
+            params_date["publishedAfter"] = date_start
+            params_date["publishedBefore"] = date_end
+
+            data = run_search(params_date, "TeamDateWindow")
+            if data is None:
+                return []
+            items = data.get("items", [])
+
+        # Limit to first five raw items before deeper validation
+        if items:
+            items = items[:5]
+
+        # Soft-validate by match date window if available (non-strict; only filter when matches found)
+        if match_date and items:
+            date_start = f"{match_date}T00:00:00Z"
+            date_end = f"{match_date}T23:59:59Z"
+            validated = []
+            for it in items:
+                published_at = (it.get("snippet", {}) or {}).get("publishedAt", "")
+                if published_at and date_start <= published_at <= date_end:
+                    validated.append(it)
+            if validated:
+                items = validated
+
+        # Preserve a last-resort candidate (first result from general search)
+        last_resort_candidate = items[:1] if items else []
+
+        # Helper: run focused channel searches sequentially until one returns items
+        def _run_channel_focus() -> list:
+            if not known_channel_ids:
+                return []
+            print("[YouTubeAPI] Running focused channel searches (sequential)")
+            channel_results_local: list = []
+            seen_video_ids: set[str] = set()
+
+            # Cap the amount of focused results we accumulate to avoid noise
+            max_focus_results = min(len(known_channel_ids) * 5, search_max)
+
+            for idx, ch_id in enumerate(known_channel_ids, start=1):
+                ch_params = params.copy()
+                ch_params["channelId"] = ch_id
+                ch_params["q"] = team_query or q_value
+                # Use recency when we lack a match date; otherwise prefer relevance
+                if match_date:
+                    ch_params.pop("order", None)
+                else:
+                    ch_params["order"] = "date"
+
+                data_focus = run_search(ch_params, f"ChannelFocus:{ch_id}")
+                num_items = len((data_focus or {}).get("items", []) or [])
+                print(f"[YouTubeAPI] ChannelFocus:{ch_id} returned {num_items} items")
+
+                for item in (data_focus or {}).get("items", []) or []:
+                    video_id = (item.get("id") or {}).get("videoId") or item.get("id")
+                    if video_id and video_id in seen_video_ids:
+                        continue
+                    if video_id:
+                        seen_video_ids.add(video_id)
+                    channel_results_local.append(item)
+
+                # Continue to next trusted channel unless we have enough focused results
+                if len(channel_results_local) >= max_focus_results:
+                    break
+            if channel_results_local:
+                channel_results_local = channel_results_local[:max_focus_results]
+                print(f"[YouTubeAPI] Using focused channel results: {len(channel_results_local)} items across {min(idx, len(known_channel_ids))} channels")
+            else:
+                print("[YouTubeAPI] Focused channel searches returned 0 items")
+            return channel_results_local
+
+        # If none of the top results are from known official channels OR we have no items, try focused channel searches
+        if known_channel_ids:
+            need_focus = False
+            if items:
+                items_with_official = [
+                    it for it in items
+                    if (it.get("snippet", {}) or {}).get("channelId") in known_channel_ids
+                ]
+                need_focus = not items_with_official
+                if need_focus:
+                    print("[YouTubeAPI] No official channels in top results; will run channel-focused searches")
+            else:
+                need_focus = True
+                print("[YouTubeAPI] No items yet; will run channel-focused searches before fallbacks")
+
+            if need_focus:
+                channel_results = _run_channel_focus()
+                if channel_results:
+                    items = channel_results
+        
+        # Fallback 1: widen search if nothing found (remove date window, any duration, relevance order)
+        if not items:
+            print("[YouTubeAPI] Primary search returned 0 items; widening search (no date window, any duration, relevance order)")
+            params_fallback = params.copy()
+            params_fallback.pop("publishedAfter", None)
+            params_fallback.pop("publishedBefore", None)
+            params_fallback["videoDuration"] = "any"
+            params_fallback["order"] = "relevance"
+            data = run_search(params_fallback, "Fallback")
+            if data is None:
+                return []
+            items = data.get("items", [])
+        
+        # Fallback 2: if still empty, try ultra-broad (no window, any duration, order=date)
+        if not items:
+            print("[YouTubeAPI] Fallback search returned 0 items; trying ultra-broad (no window, any duration, order=date)")
+            params_ultra = params.copy()
+            params_ultra.pop("publishedAfter", None)
+            params_ultra.pop("publishedBefore", None)
+            params_ultra["videoDuration"] = "any"
+            params_ultra["order"] = "date"
+            data = run_search(params_ultra, "UltraBroad")
+            if data is None:
+                return []
+            items = data.get("items", [])
+        
+        if not items:
+            if last_resort_candidate:
+                print("[YouTubeAPI] All attempts failed; returning last-resort first result from initial search")
+                items = last_resort_candidate
+            else:
+                print("[YouTubeAPI] All YouTube API attempts returned 0 items")
+                return []
+        
+        video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+        
+        if not video_ids:
+            print("[YouTubeAPI] No video ids returned")
+            return []
+        
+        details_resp = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "snippet,contentDetails,statistics",
+                "id": ",".join(video_ids),
+                "key": api_key,
+            },
+            timeout=10,
+        )
+        if details_resp.status_code != 200:
+            print(f"[YouTubeAPI] videos error {details_resp.status_code}: {details_resp.text[:200]}")
+            return []
+        
+        details = details_resp.json().get("items", [])
+        results = []
+        simulations_filtered = 0
+        too_long_filtered = 0
+        
+        for item in details:
+            vid = item.get("id")
+            snippet = item.get("snippet", {}) or {}
+            content = item.get("contentDetails", {}) or {}
+            
+            title = snippet.get("title", "Untitled")
+            description = snippet.get("description", "")
+            publisher = snippet.get("channelTitle", "")
+            channel_id = snippet.get("channelId", "")
+            
+            duration_iso = content.get("duration", "")
+            duration_seconds = _parse_iso8601_duration(duration_iso)
+            duration_str = _format_seconds_hms(duration_seconds)
+            
+            if _is_duration_too_long(duration_str):
+                too_long_filtered += 1
+                continue
+            
+            if _is_simulation(title, description, publisher):
+                simulations_filtered += 1
+                continue
+            
+            upload_iso = snippet.get("publishedAt", "")
+            upload_date = ""
+            if upload_iso and "T" in upload_iso:
+                upload_date = upload_iso.split("T")[0]
+            
+            is_tier1 = _is_tier1_channel(publisher)
+            is_top_priority = is_tier1 or _is_top_priority_channel(publisher)
+            is_trusted = is_top_priority or _is_trusted_channel(publisher)
+            
+            video_url = f"https://www.youtube.com/watch?v={vid}"
+            
+            # Optional channel validation (non-strict)
+            is_official_channel = channel_id in known_channel_ids if channel_id else False
+            
+            results.append({
+                "title": title,
+                "url": video_url,
+                "duration": duration_str,
+                "thumbnail": (snippet.get("thumbnails", {}).get("high", {}) or {}).get("url", ""),
+                "description": description,
+                "publisher": publisher,
+                "channel_id": channel_id,
+                "is_youtube": True,
+                "is_tier1": is_tier1,
+                "is_top_priority": is_top_priority,
+                "is_trusted": is_trusted,
+                "is_official_channel": is_official_channel,
+                "is_simulation": False,
+                "video_id": vid,
+                "upload_date": upload_date,
+            })
+        
+        if too_long_filtered > 0:
+            print(f"[YouTubeAPI] Filtered out {too_long_filtered} videos >1 hour")
+        if simulations_filtered > 0:
+            print(f"[YouTubeAPI] Filtered out {simulations_filtered} simulation/game videos")
+        
+        print(f"[YouTubeAPI] Raw results after filtering: {len(results)}")
+        
+        results.sort(key=lambda x: (
+            not x.get("is_top_priority", False),
+            not x.get("is_trusted", False),
+        ))
+        
+        return results[:max_results]
+    
+    except Exception as e:
+        print(f"[YouTubeAPI] Exception: {e}")
+        return []
+
+
+def _search_youtube_highlights(
+    query: str,
+    max_results: int = MAX_RESULTS,
+    match_info: dict | None = None,
+    mode: str = "auto"
+) -> list[dict]:
+    """
+    Search for YouTube highlight videos.
+    
+    Primary: YouTube Data API (requires YOUTUBE_API_KEY).
+    Fallback: DuckDuckGo video search.
     
     Args:
-        query: Search query (e.g., "Arsenal vs Chelsea highlights").
-        max_results: Maximum number of results to return.
-        
-    Returns:
-        List of video results with title, url, duration, and thumbnail.
+        query: Search string.
+        max_results: Number of items to return.
+        match_info: Parsed match metadata.
+        mode: "auto" (API with DDG fallback), "api" (API only), "ddg" (DDG only).
     """
+    use_api = mode in ("auto", "api")
+    use_ddg = mode in ("auto", "ddg")
+    
+    api_results: list[dict] = []
+    ddg_results: list[dict] = []
+    if use_api:
+        api_results = _search_youtube_api_highlights(query, max_results=max_results, match_info=match_info)
+        if api_results:
+            print(f"[YouTubeSearch] Using YouTube Data API results ({len(api_results)})")
+            return api_results
+        if mode == "api":
+            return api_results
+        # Only print fallback notice when we are about to try DDG
+        if use_ddg:
+            print("[YouTubeSearch] YouTube Data API returned 0 results; falling back to DuckDuckGo")
+    
+    if not use_ddg:
+        return []
+    
     try:
         from ddgs import DDGS
         
         results = []
         simulations_filtered = 0
         too_long_filtered = 0
+        
+        print(f"[YouTubeSearch][DDG] Sending query: \"{query}\" (max_results={max_results}, fetch={max_results * 8})")
         
         with DDGS() as ddgs:
             # Search for videos - fetch more to filter
@@ -1672,6 +2220,15 @@ def _search_youtube_highlights(query: str, max_results: int = MAX_RESULTS) -> li
                 is_top_priority = is_tier1 or _is_top_priority_channel(publisher)
                 is_trusted = is_top_priority or _is_trusted_channel(publisher)
                 
+                # Extract video ID from URL (for later fetching upload date)
+                video_id = None
+                if "youtube.com/watch?v=" in video_url:
+                    video_id = video_url.split("watch?v=")[1].split("&")[0]
+                elif "youtu.be/" in video_url:
+                    video_id = video_url.split("youtu.be/")[1].split("?")[0]
+                
+                # DON'T fetch upload date here - too slow! Fetch only for top results later
+                
                 results.append({
                     "title": title,
                     "url": video_url,
@@ -1684,6 +2241,8 @@ def _search_youtube_highlights(query: str, max_results: int = MAX_RESULTS) -> li
                     "is_top_priority": is_top_priority,
                     "is_trusted": is_trusted,
                     "is_simulation": False,
+                    "video_id": video_id,  # Store for later fetching
+                    # "upload_date": upload_date,  # Fetch later for top results only
                 })
         
         if too_long_filtered > 0:
@@ -1691,20 +2250,22 @@ def _search_youtube_highlights(query: str, max_results: int = MAX_RESULTS) -> li
         if simulations_filtered > 0:
             print(f"[YouTubeSearch] Filtered out {simulations_filtered} simulation/game videos")
         
+        print(f"[YouTubeSearch][DDG] Raw results after filtering: {len(results)}")
+        
         # Sort: TOP PRIORITY first, then trusted, then others
         results.sort(key=lambda x: (
             not x.get("is_top_priority", False),
             not x.get("is_trusted", False),
         ))
         
-        return results[:max_results]
+        ddg_results = results[:max_results]
         
     except ImportError:
         print("[YouTubeSearch] ddgs library not installed. Run: pip install ddgs")
-        return []
+        ddg_results = []
     except Exception as e:
         print(f"[YouTubeSearch] Error searching videos: {e}")
-        return []
+        ddg_results = []
 
 
 def _video_matches_query(video: dict, match_info: dict) -> bool:
@@ -1752,9 +2313,18 @@ def _video_matches_query(video: dict, match_info: dict) -> bool:
     return True
 
 
-def search_match_highlights(match_query: str, deep_validate: bool = False) -> list[dict]:
+def search_match_highlights(
+    home_team: str = None,
+    away_team: str = None,
+    match_date: str = None,
+    competition: str = None,
+    deep_validate: bool = False
+) -> list[dict]:
     """
     Search for match highlights on YouTube from trusted sports channels.
+    
+    NOTE: This function now receives parsed data instead of parsing queries itself.
+    This follows the agent chain architecture where the Query Parser Agent handles all parsing.
     
     Uses comprehensive relevance scoring to return ONLY highly relevant results.
     
@@ -1766,7 +2336,10 @@ def search_match_highlights(match_query: str, deep_validate: bool = False) -> li
         - Scores and filters by relevance (minimum threshold)
     
     Args:
-        match_query: Match description (e.g., "Arsenal vs Chelsea 2024-03-15").
+        home_team: Home team name (from query parser).
+        away_team: Away team name (from query parser).
+        match_date: Match date in YYYY-MM-DD format (from query parser).
+        competition: Competition name (from query parser).
         deep_validate: If True, fetches video description/transcript for validation.
         
     Returns:
@@ -1775,12 +2348,42 @@ def search_match_highlights(match_query: str, deep_validate: bool = False) -> li
     print(f"\n{'='*60}")
     print(f"[YouTubeSearch] STARTING HIGHLIGHT SEARCH")
     print(f"{'='*60}")
-    print(f"[YouTubeSearch] Original query: \"{match_query}\"")
     
-    # Parse the match query intelligently
-    match_info = _parse_match_info(match_query)
+    if not home_team:
+        print(f"[YouTubeSearch] ERROR: No home team provided")
+        return []
     
-    # Log what we understood
+    # Build match_info dict from provided parameters
+    match_info = {
+        "home_team": home_team,
+        "away_team": away_team,
+        "date": match_date,
+        "competition": competition,
+        "season": None,
+        "year": None,
+        "month_year": None,
+        "is_most_recent": False,
+    }
+    
+    # Extract year from date if present
+    if match_date:
+        try:
+            dt = datetime.strptime(match_date, "%Y-%m-%d")
+            match_info["year"] = str(dt.year)
+            match_info["month_year"] = dt.strftime("%B %Y")
+        except ValueError:
+            pass
+    
+    # Default to current season if nothing specified
+    if not match_info["season"] and not match_info["year"] and not match_info["date"]:
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        if current_month >= 8:
+            match_info["season"] = f"{current_year}-{str(current_year + 1)[2:]}"
+        else:
+            match_info["season"] = f"{current_year - 1}-{str(current_year)[2:]}"
+    
+    # Log what we're searching for
     home = match_info.get("home_team", "Unknown")
     away = match_info.get("away_team", "Unknown")
     date = match_info.get("date", "Not specified")
@@ -1805,15 +2408,14 @@ def search_match_highlights(match_query: str, deep_validate: bool = False) -> li
     seen_urls = set()
     wrong_match_filtered = 0
     
-    print(f"\n[YouTubeSearch] === Executing Searches ===")
+    print(f"\n[YouTubeSearch] === Executing Searches (Multi-Stage) ===")
     
     # Run more queries to get a larger pool for relevance scoring
     queries_to_run = queries[:6]  # Run up to 6 queries
+    api_available = bool(get_youtube_api_key())
     
-    for query in queries_to_run:
-        print(f"\n[YouTubeSearch] Searching: \"{query}\"")
-        results = _search_youtube_highlights(query, max_results=6)
-        
+    def _consume_results(results: list[dict], source_label: str):
+        nonlocal wrong_match_filtered
         for result in results:
             url = result.get("url", "")
             title = result.get("title", "")
@@ -1824,16 +2426,47 @@ def search_match_highlights(match_query: str, deep_validate: bool = False) -> li
                 # VALIDATE: Check if video matches the teams we're looking for
                 if not _video_matches_query(result, match_info):
                     wrong_match_filtered += 1
-                    print(f"[YouTubeSearch]   ✗ Wrong match: {title[:45]}...")
+                    print(f"[YouTubeSearch]   ✗ ({source_label}) Wrong match: {title[:45]}...")
                     continue
                 
-                print(f"[YouTubeSearch]   ✓ Match found: {title[:45]}...")
+                print(f"[YouTubeSearch]   ✓ ({source_label}) Match found: {title[:45]}...")
                 result["match_info"] = match_info
                 all_results.append(result)
-        
-        # Stop if we have a good pool of results
-        if len(all_results) >= MAX_SEARCH_RESULTS:
-            break
+    
+    # -------- Stage 1: YouTube Data API across all queries --------
+    if api_available:
+        print(f"[YouTubeSearch] Stage 1: YouTube Data API")
+        for query in queries_to_run:
+            print(f"\n[YouTubeSearch][Stage 1] Searching: \"{query}\"")
+            results = _search_youtube_highlights(
+                query,
+                max_results=6,
+                match_info=match_info,
+                mode="api",
+            )
+            _consume_results(results, "API")
+            
+            # Stop if we have a good pool of results
+            if len(all_results) >= MAX_SEARCH_RESULTS:
+                break
+    else:
+        print("[YouTubeSearch] Stage 1 skipped (YOUTUBE_API_KEY not set)")
+    
+    # -------- Stage 2: DuckDuckGo fallback only if needed --------
+    if len(all_results) < MAX_RESULTS:
+        print(f"\n[YouTubeSearch] Stage 2: DuckDuckGo fallback (API insufficient)")
+        for query in queries_to_run:
+            print(f"\n[YouTubeSearch][Stage 2] Searching: \"{query}\"")
+            results = _search_youtube_highlights(
+                query,
+                max_results=6,
+                match_info=match_info,
+                mode="ddg",
+            )
+            _consume_results(results, "DDG")
+            
+            if len(all_results) >= MAX_SEARCH_RESULTS:
+                break
     
     # Log raw results
     print(f"\n[YouTubeSearch] === Raw Results Summary ===")
@@ -2301,6 +2934,59 @@ TRUSTED_HIGHLIGHT_CHANNELS = [
     "spurs",
 ]
 
+# Trusted channel IDs for YouTube Data API scoped searches
+TRUSTED_HIGHLIGHT_CHANNEL_IDS = [
+    {
+        "name": "NBC Sports",
+        "id": "UCqZQlzSHbVJrwrn5XvzrzcA",  # PL (US)
+        "notes": "Premier League highlights (US rights)",
+    },
+    {
+        "name": "ESPN",
+        "id": "UC6c1z7bA__85CIWZ_jpCK-Q",  # ESPN FC highlights
+        "notes": "La Liga / some PL when NBC unavailable",
+    },
+    {
+        "name": "CBS Sports Golazo",
+        "id": "UCET00YnetHT7tOpu12v8jxg",  # UCL/UEFA highlights
+        "notes": "Champions League highlights",
+    },
+]
+
+
+def _channels_for_competition(match_info: dict | None) -> list[dict]:
+    """
+    Return trusted channels ordered by competition relevance.
+    
+    Args:
+        match_info: dict with competition key (e.g., "Premier League", "La Liga", "Champions League")
+    """
+    if not match_info:
+        return TRUSTED_HIGHLIGHT_CHANNEL_IDS
+    
+    comp = (match_info.get("competition") or "").lower()
+    if "champions league" in comp or "ucl" in comp or "uefa" in comp:
+        return [
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "golazo" in c["name"].lower()), None),
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "nbc" in c["name"].lower()), None),
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "espn" in c["name"].lower()), None),
+        ]
+    if "premier league" in comp or "epl" in comp or "pl" in comp:
+        return [
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "nbc" in c["name"].lower()), None),
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "espn" in c["name"].lower()), None),
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "golazo" in c["name"].lower()), None),
+        ]
+    if "la liga" in comp or "laliga" in comp:
+        return [
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "espn" in c["name"].lower()), None),
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "nbc" in c["name"].lower()), None),
+            next((c for c in TRUSTED_HIGHLIGHT_CHANNEL_IDS if "golazo" in c["name"].lower()), None),
+        ]
+    
+    # Fallback: all channels in default order
+    return TRUSTED_HIGHLIGHT_CHANNEL_IDS
+
 
 # =============================================================================
 # RAG-Based Video Validation Against Web Search Results
@@ -2394,10 +3080,11 @@ def _validate_video_against_web_context(
     This is the RAG validation step:
     1. Uses the web search summary as ground truth
     2. Compares video title/description against known match facts
-    3. Returns validation result with confidence
+    3. Checks upload date (must be within 5 days of match date)
+    4. Returns validation result with confidence
     
     Args:
-        video: Video dict with title, description, url
+        video: Video dict with title, description, url, upload_date (if fetched)
         web_summary: The LLM-generated summary from web search
         match_metadata: Dict with home_team, away_team, match_date, score
         
@@ -2413,11 +3100,70 @@ def _validate_video_against_web_context(
         title = video.get("title", "")
         description = video.get("description", "")
         publisher = video.get("publisher", "")
+        upload_date = video.get("upload_date")  # May be None if not fetched yet
         
         home_team = match_metadata.get("home_team", "Unknown")
         away_team = match_metadata.get("away_team", "Unknown")
         match_date = match_metadata.get("match_date", "Unknown")
         score = match_metadata.get("score", "Unknown")
+        
+        # CRITICAL: Check upload date if available
+        upload_date_valid = True
+        upload_date_reason = ""
+        if upload_date and match_date and match_date != "Unknown":
+            try:
+                from datetime import datetime, timedelta
+                match_dt = datetime.strptime(match_date, "%Y-%m-%d")
+                upload_dt = datetime.strptime(upload_date, "%Y-%m-%d")
+                
+                # Check if upload date is within 5 days of match date
+                day_diff = abs((upload_dt - match_dt).days)
+                if day_diff > 5:
+                    upload_date_valid = False
+                    upload_date_reason = f"Upload date ({upload_date}) is {day_diff} days from match date ({match_date}) - exceeds 5 day window"
+                    print(f"[RAGValidation] ⚠️ Upload date check FAILED: {upload_date_reason}")
+                else:
+                    upload_date_reason = f"Upload date ({upload_date}) is {day_diff} days from match date - VALID"
+                    print(f"[RAGValidation] ✓ Upload date check PASSED: {upload_date_reason}")
+            except Exception as e:
+                print(f"[RAGValidation] Could not parse dates for validation: {e}")
+        
+        # If upload date is invalid, reject immediately (HUGE CRITERIA)
+        if not upload_date_valid:
+            return {
+                "is_valid": False,
+                "confidence": 0.1,
+                "reason": upload_date_reason
+            }
+        
+        # Fetch full description if not already available
+        full_description = description
+        if not full_description or len(full_description) < 100:
+            # Try to fetch from video URL
+            video_url = video.get("url", "")
+            if video_url:
+                metadata = _fetch_video_metadata(video_url)
+                full_description = metadata.get("description", description)
+                # Update video dict with fetched description
+                video["description"] = full_description
+                if not upload_date and metadata.get("upload_date"):
+                    upload_date = metadata.get("upload_date")
+                    video["upload_date"] = upload_date
+                    # Re-check upload date with fetched date
+                    if upload_date and match_date and match_date != "Unknown":
+                        try:
+                            from datetime import datetime
+                            match_dt = datetime.strptime(match_date, "%Y-%m-%d")
+                            upload_dt = datetime.strptime(upload_date, "%Y-%m-%d")
+                            day_diff = abs((upload_dt - match_dt).days)
+                            if day_diff > 5:
+                                return {
+                                    "is_valid": False,
+                                    "confidence": 0.1,
+                                    "reason": f"Upload date ({upload_date}) is {day_diff} days from match date ({match_date}) - exceeds 5 day window"
+                                }
+                        except:
+                            pass
         
         prompt = f"""You are validating if a YouTube video shows the CORRECT match highlights based on verified web search results.
 
@@ -2433,19 +3179,30 @@ Summary from web search:
 === YOUTUBE VIDEO TO VALIDATE ===
 Title: {title}
 Publisher: {publisher}
-Description: {description[:500] if description else "N/A"}
+Upload Date: {upload_date if upload_date else "Not available"}
+Description: {full_description[:800] if full_description else "N/A"}
 
 === VALIDATION TASK ===
 Determine if this YouTube video is showing highlights for the SAME match described above.
 
-CRITICAL CHECKS:
-1. **Team Names Match**: Both teams should be the same (exact match or clear variations)
-2. **Home/Away Order**: The video title should show "{home_team}" as home team and "{away_team}" as away team.
+CRITICAL CHECKS (in order of importance):
+1. **UPLOAD DATE IS HUGE CRITERIA**: The video upload date must be within 5 days of the match date ({match_date}).
+   - If upload date is {upload_date if upload_date else "not available"}, verify it's within 5 days
+   - If upload date is more than 5 days from match date, REJECT immediately
+   - This is the MOST IMPORTANT check - videos uploaded weeks/months later are likely wrong matches
+
+2. **Video Description Check**: The description often contains key match details
+   - Check if description mentions the correct teams, score, or key events
+   - Description should align with the web search summary
+   - If description contradicts the match info, REJECT
+
+3. **Team Names Match**: Both teams should be the same (exact match or clear variations)
+4. **Home/Away Order**: The video title should show "{home_team}" as home team and "{away_team}" as away team.
    - If video shows "{away_team} vs {home_team}" or "{away_team} v {home_team}", that's OK (order can be reversed in titles)
    - But if video shows a DIFFERENT team as home, it's INVALID
-3. **Date/Time Context**: Same match, not an older game between these teams
-4. **Score Match**: If score shown in title (e.g., "3-0"), it should match "{score}"
-5. **Different Match**: Reject if it's from a PREVIOUS match between the same teams
+5. **Date/Time Context**: Same match, not an older game between these teams
+6. **Score Match**: If score shown in title (e.g., "3-0"), it should match "{score}"
+7. **Different Match**: Reject if it's from a PREVIOUS match between the same teams
 
 IMPORTANT: Team order matters! "{home_team} vs {away_team}" means {home_team} is HOME.
 If the video title clearly shows a different team as home, it's INVALID.
@@ -2539,15 +3296,50 @@ def _validate_videos_with_rag(
     
     for video in videos:
         title = video.get("title", "")
+        video_url = video.get("url", "")
         
-        # Step 1: Embeddings-based similarity (if available)
+        # Step 0: Fetch video description and upload date if not already available
+        if video_url and (not video.get("description") or len(video.get("description", "")) < 50):
+            print(f"[RAGValidation] Fetching video metadata for validation...")
+            metadata = _fetch_video_metadata(video_url)
+            if metadata.get("description"):
+                video["description"] = metadata.get("description", "")
+            if metadata.get("upload_date"):
+                video["upload_date"] = metadata.get("upload_date")
+        
+        # Step 1: Check upload date FIRST (huge criteria - reject if >5 days)
+        match_date = match_metadata.get("match_date")
+        upload_date = video.get("upload_date")
+        
+        # Debug: Show upload date if available
+        if upload_date:
+            print(f"[RAGValidation] 📅 Upload date: {upload_date} | Match date: {match_date or 'Unknown'}")
+        
+        if upload_date and match_date and match_date != "Unknown":
+            try:
+                from datetime import datetime
+                match_dt = datetime.strptime(match_date, "%Y-%m-%d")
+                upload_dt = datetime.strptime(upload_date, "%Y-%m-%d")
+                day_diff = abs((upload_dt - match_dt).days)
+                
+                if day_diff > 5:
+                    print(f"[RAGValidation] ❌ REJECTED (Upload date): {title[:40]}... (uploaded {day_diff} days from match)")
+                    continue  # Skip this video entirely
+                else:
+                    print(f"[RAGValidation] ✓ Upload date valid ({day_diff} days): {title[:40]}...")
+            except Exception as e:
+                print(f"[RAGValidation] ⚠️ Could not validate upload date: {e}")
+        elif not upload_date:
+            print(f"[RAGValidation] ⚠️ No upload date available for: {title[:40]}... (continuing without date check)")
+        
+        # Step 2: Embeddings-based similarity (if available)
         embedding_result = {"similarity_score": 0.5, "is_likely_match": True}
         if RAG_EMBEDDINGS_AVAILABLE:
             embedding_result = _validate_video_with_embeddings(video, web_summary, match_metadata)
             similarity = embedding_result["similarity_score"]
             print(f"[RAGValidation] 📊 Embedding similarity: {similarity:.2f} - {title[:40]}...")
         
-        # Step 2: LLM validation for detailed verification
+        # Step 3: LLM validation for detailed verification (includes description check)
         llm_validation = _validate_video_against_web_context(video, web_summary, match_metadata)
         
         # Combine results: Both must pass
@@ -2689,34 +3481,55 @@ def search_and_display_highlights_with_metadata(
     queries = []
     
     # Competition-specific source prioritization
+    # Build VERY SPECIFIC queries with: teams (home/away order), competition, date, and channel
+    print(f"\n[YouTubeSearch] === Building Specific Search Queries ===")
+    print(f"[YouTubeSearch] Competition: {competition or 'Not specified'}")
+    print(f"[YouTubeSearch] Match: {home_team} vs {away_team}")
+    print(f"[YouTubeSearch] Date: {match_date or 'Not specified'}")
+    
+    # Build specific queries with all key info: teams + competition + date + channel
     if is_ucl:
-        # Champions League: Prioritize CBS Sports Golazo, UEFA, official clubs
+        # Champions League: Very specific CBS Sports Golazo queries
+        print(f"[YouTubeSearch] 🏆 Champions League - targeting CBS Sports Golazo")
         if nbc_date:
-            queries.append(f"{match_str} CBS Sports Golazo {nbc_date}")
-            queries.append(f"{match_str_reverse} CBS Sports Golazo {nbc_date}")
-        queries.append(f"{match_str} CBS Sports Golazo highlights {month_name} {year}")
-        queries.append(f"{match_str} UEFA Champions League highlights {year}")
-        queries.append(f"{match_str} Champions League highlights {year}")
-        # Also check NBC Sports (they cover UCL too)
-        if nbc_date:
-            queries.append(f"{match_str} NBC Sports {nbc_date}")
-        queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
+            # Most specific: teams + competition + date + channel
+            queries.append(f"{home_team} {away_team} Champions League {nbc_date} CBS Sports Golazo highlights")
+            queries.append(f"{match_str} Champions League {nbc_date} CBS Sports Golazo")
+        queries.append(f"{match_str} Champions League {month_name} {year} CBS Sports Golazo highlights")
+        queries.append(f"{match_str} UEFA Champions League {year} highlights")
     elif is_premier_league:
-        # Premier League: Prioritize NBC Sports, Premier League official, official clubs
+        # Premier League: Very specific NBC Sports queries
+        print(f"[YouTubeSearch] 🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League - targeting NBC Sports")
         if nbc_date:
-            queries.append(f"{match_str} NBC Sports {nbc_date}")
-            queries.append(f"{match_str_reverse} NBC Sports {nbc_date}")
-        queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
-        queries.append(f"{match_str} Premier League highlights {year}")
-        queries.append(f"{match_str} Premier League official highlights {year}")
+            queries.append(f"{home_team} {away_team} Premier League {nbc_date} NBC Sports highlights")
+            queries.append(f"{match_str} Premier League {nbc_date} NBC Sports")
+        queries.append(f"{match_str} Premier League {month_name} {year} NBC Sports highlights")
+        queries.append(f"{match_str} Premier League {year} NBC Sports highlights")
+    elif "la liga" in competition or "laliga" in competition:
+        # La Liga: Very specific ESPN and La Liga channel queries (like in the image)
+        print(f"[YouTubeSearch] 🇪🇸 La Liga - targeting ESPN and La Liga EA Sports")
+        if nbc_date:
+            # Most specific: teams + La Liga + date + ESPN
+            queries.append(f"{home_team} {away_team} La Liga {nbc_date} ESPN highlights")
+            queries.append(f"{match_str} La Liga {nbc_date} ESPN FC highlights")
+            # Also try La Liga EA Sports channel (official)
+            queries.append(f"{home_team} {away_team} La Liga {nbc_date} LALIGA highlights")
+            queries.append(f"{match_str} La Liga {nbc_date} LALIGA EA SPORTS highlights")
+        # With month/year
+        queries.append(f"{match_str} La Liga {month_name} {year} ESPN highlights")
+        queries.append(f"{match_str} La Liga {month_name} {year} LALIGA highlights")
+        queries.append(f"{match_str} La Liga {year} ESPN FC highlights")
+        queries.append(f"{match_str} La Liga {year} LALIGA EA SPORTS highlights")
     else:
-        # Other competitions: Use all trusted sources
-        if nbc_date:
-            queries.append(f"{match_str} NBC Sports {nbc_date}")
-            queries.append(f"{match_str_reverse} NBC Sports {nbc_date}")
-        queries.append(f"{match_str} NBC Sports highlights {month_name} {year}")
-        queries.append(f"{match_str} CBS Sports Golazo highlights {year}")
-        queries.append(f"{match_str} ESPN FC highlights {year}")
+        # Other competitions: Include competition name in query
+        print(f"[YouTubeSearch] 🌍 Other competition - including competition name")
+        comp_name = competition.replace(" league", "").replace(" cup", "").title() if competition else ""
+        if nbc_date and comp_name:
+            queries.append(f"{home_team} {away_team} {comp_name} {nbc_date} highlights")
+            queries.append(f"{match_str} {comp_name} {nbc_date} highlights")
+        if comp_name:
+            queries.append(f"{match_str} {comp_name} {month_name} {year} highlights")
+            queries.append(f"{match_str} {comp_name} {year} highlights")
     
     # Official club channels (always include)
     if home_team:
@@ -2724,16 +3537,27 @@ def search_and_display_highlights_with_metadata(
     if away_team:
         queries.append(f"{away_team} official highlights vs {home_team} {month_name} {year}")
     
-    print(f"\n[YouTubeSearch] Searching trusted channels...")
-    for q in queries[:4]:
+    print(f"\n[YouTubeSearch] Searching with specific queries...")
+    for q in queries[:5]:
         print(f"[YouTubeSearch]   • {q}")
     
-    # Collect results
+    # Collect results - get first 10 videos from most specific queries
     all_results = []
     seen_urls = set()
     
-    for query in queries[:5]:  # Limit queries
-        results = _search_youtube_highlights(query, max_results=5)
+    # Use most specific queries first (with date and channel)
+    prioritized_queries = sorted(queries, key=lambda q: (
+        nbc_date not in q,  # Queries with date first
+        "highlights" not in q.lower(),  # Queries with "highlights" first
+    ))
+    
+    for query in prioritized_queries[:3]:  # Use top 3 most specific queries
+        print(f"[YouTubeSearch] Searching: \"{query}\"")
+        results = _search_youtube_highlights(
+            query,
+            max_results=10,  # Get first 10 from each query
+            match_info={"home_team": home_team, "away_team": away_team, "date": match_date}
+        )
         for r in results:
             url = r.get("url", "")
             if url and url not in seen_urls:
@@ -2741,17 +3565,36 @@ def search_and_display_highlights_with_metadata(
                 # Check if matches both teams
                 if _video_matches_query(r, {"home_team": home_team, "away_team": away_team}):
                     all_results.append(r)
+                    if len(all_results) >= 10:  # Stop once we have 10 candidates
+                        break
+        if len(all_results) >= 10:
+            break
     
-    print(f"[YouTubeSearch] Found {len(all_results)} matching videos")
+    print(f"[YouTubeSearch] Found {len(all_results)} candidate videos (will validate top 10)")
+    
+    # Limit to top 10 for validation
+    all_results = all_results[:10]
+    
+    # NOW fetch upload dates only for these top 10 candidates
+    print(f"[YouTubeSearch] Fetching upload dates for {len(all_results)} top candidates...")
+    for video in all_results:
+        video_id = video.get("video_id")
+        if video_id and not video.get("upload_date"):
+            try:
+                upload_date = _fetch_video_upload_date(video_id, show_debug=True)
+                if upload_date:
+                    video["upload_date"] = upload_date
+            except Exception as e:
+                pass  # Silently handle errors
     
     if not all_results:
-        return _not_found_message(f"{home_team} vs {away_team}")
+        return _not_found_message(home_team, away_team)
     
     # Filter and validate results (basic filtering)
     validated = _validate_and_filter_highlights(all_results, home_team, away_team, match_dt)
     
     if not validated:
-        return _not_found_message(f"{home_team} vs {away_team}")
+        return _not_found_message(home_team, away_team)
     
     # RAG Validation: If we have web search context, validate videos against it
     if use_rag_validation:
@@ -2769,7 +3612,7 @@ def search_and_display_highlights_with_metadata(
             validated = _validate_and_filter_highlights(all_results, home_team, away_team, match_dt)[:MAX_RESULTS]
     
     if not validated:
-        return _not_found_message(f"{home_team} vs {away_team}")
+        return _not_found_message(home_team, away_team)
     
     return format_highlight_results(validated, match_metadata)
 
@@ -2927,10 +3770,30 @@ def search_and_display_highlights(match_query: str, use_llm: bool = True) -> str
     Returns:
         Formatted string with highlight results.
     """
-    results = search_match_highlights(match_query)
+    # DEPRECATED: This function should receive parsed data instead of a query string
+    # For now, we'll try to extract teams from the query string as a fallback
+    # But ideally, callers should use search_and_display_highlights_with_metadata() instead
+    
+    # Try to extract teams from query (simple regex fallback)
+    import re
+    match = re.search(r'([A-Za-z\s]+)\s+vs\s+([A-Za-z\s]+)', match_query, re.IGNORECASE)
+    if match:
+        home_team = match.group(1).strip()
+        away_team = match.group(2).strip()
+    else:
+        # Single team
+        home_team = match_query.strip()
+        away_team = None
+    
+    results = search_match_highlights(
+        home_team=home_team,
+        away_team=away_team,
+        match_date=None,
+        competition=None
+    )
     
     if not results:
-        return _not_found_message(match_query)
+        return _not_found_message(home_team, away_team)
     
     # Format all results
     output = format_highlight_results(results)
@@ -2938,12 +3801,14 @@ def search_and_display_highlights(match_query: str, use_llm: bool = True) -> str
     return output
 
 
-def _not_found_message(query: str) -> str:
-    """Return a friendly message when no highlights are found."""
-    # Parse to give better feedback
-    parsed = _parse_match_info(query)
-    home = parsed.get("home_team", "Unknown")
-    away = parsed.get("away_team", "")
+def _not_found_message(home_team: str = None, away_team: str = None) -> str:
+    """
+    Return a friendly message when no highlights are found.
+    
+    NOTE: This function now receives parsed data instead of parsing queries itself.
+    """
+    home = home_team or "Unknown"
+    away = away_team or ""
     
     match_str = f"{home} vs {away}" if away else home
     
