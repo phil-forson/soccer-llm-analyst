@@ -38,6 +38,7 @@ def _get_youtube_client():
             "Set it in your .env or shell before running the server."
         )
     logger.info("Initialising YouTube client | agent_version=%s", AGENT_VERSION)
+    print(f"[YouTube] Initialising client | agent_version={AGENT_VERSION}")
     return build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
 
@@ -87,6 +88,7 @@ def build_search_queries(
             uniq_queries.append(q)
 
     logger.info("Highlight search queries (agent=%s): %s", AGENT_VERSION, uniq_queries)
+    print(f"[YouTube] Highlight search queries: {uniq_queries}")
     return uniq_queries
 
 
@@ -98,6 +100,12 @@ def _search_youtube(
     published_before: Optional[datetime] = None,
     max_results: int = 10,
 ) -> List[Dict[str, Any]]:
+    """
+    Low-level YouTube search.
+
+    IMPORTANT: Every returned item carries `"search_query": query`
+    so you can see which text produced that result.
+    """
     params: Dict[str, Any] = {
         "part": "snippet",
         "q": query,
@@ -121,6 +129,10 @@ def _search_youtube(
         channel_id,
         params.get("publishedAfter"),
         params.get("publishedBefore"),
+    )
+    print(
+        f"[YouTube] search | query='{query}' | channel={channel_id or 'GLOBAL'} | "
+        f"after={params.get('publishedAfter')} | before={params.get('publishedBefore')}"
     )
 
     response = youtube.search().list(**params).execute()
@@ -146,10 +158,13 @@ def _search_youtube(
                 "thumbnails": snippet.get("thumbnails", {}),
                 "raw": item,
                 "source_type": "channel" if channel_id else "global",
+                # which text we actually searched for this item
+                "search_query": query,
             }
         )
 
-    logger.info("YouTube search returned %d items", len(results))
+    logger.info("YouTube search returned %d items for query='%s'", len(results), query)
+    print(f"[YouTube]   -> {len(results)} item(s) returned for query='{query}'")
     return results
 
 
@@ -200,6 +215,10 @@ def _search_on_channel_with_queries(
         len(deduped),
         len(all_items),
     )
+    print(
+        f"[YouTube] Channel {channel_id} produced {len(deduped)} unique candidates "
+        f"(before dedupe {len(all_items)})"
+    )
     return deduped
 
 
@@ -233,6 +252,10 @@ def _search_globally_with_queries(
         "Global search produced %d candidates (before dedupe %d)",
         len(deduped),
         len(all_items),
+    )
+    print(
+        f"[YouTube] GLOBAL search produced {len(deduped)} unique candidates "
+        f"(before dedupe {len(all_items)})"
     )
     return deduped
 
@@ -384,6 +407,7 @@ def _validate_with_rag(
             "No candidates contained both team names. Returning 0 highlights "
             "(better empty than Mbappé vs random team)."
         )
+        print("[YouTube] No candidates contained both team names; returning 0 highlights")
         return []
 
     candidates = filtered
@@ -394,6 +418,7 @@ def _validate_with_rag(
         len(candidates),
         context_text[:200],
     )
+    print(f"[YouTube] RAG ranking on {len(candidates)} candidates")
 
     dt = _safe_parse_date(match_date)
     score_token = _extract_score_from_context(context_text)
@@ -449,6 +474,24 @@ def _validate_with_rag(
             scored[0][0],
             scored[-1][0],
         )
+        print(
+            f"[YouTube] Ranking complete. Top score={scored[0][0]:.2f}, "
+            f"bottom score={scored[-1][0]:.2f}"
+        )
+
+    # For debugging: log top few (title + query)
+    for i, (s, item) in enumerate(scored[:5]):
+        logger.info(
+            "Top-%d candidate | score=%.2f | title=%s | query=%s",
+            i + 1,
+            s,
+            item.get("title"),
+            item.get("search_query"),
+        )
+        print(
+            f"[YouTube] Top-{i+1} | score={s:.2f} | "
+            f"title='{item.get('title')}' | query='{item.get('search_query')}'"
+        )
 
     return ranked[:max_results]
 
@@ -470,10 +513,13 @@ def search_and_display_highlights_with_metadata(
 
     It will:
     1. Build search queries from home_team, away_team, match_date
-    2. Try each preferred channel in PREFERRED_CHANNEL_IDS in order
+    2. Try ALL preferred channels in PREFERRED_CHANNEL_IDS and aggregate results
     3. If all channels fail, fall back to a global YouTube search
     4. Apply RAG-style heuristic to rank and trim results
     5. Return a list of video metadata dicts
+
+    Each returned dict includes:
+      - "search_query": the query string that produced that result.
     """
     logger.info(
         "Searching highlights | agent=%s | home_team=%s | away_team=%s | match_date=%s | "
@@ -484,14 +530,19 @@ def search_and_display_highlights_with_metadata(
         match_date,
         type(match_context).__name__ if match_context is not None else "None",
     )
+    print(
+        f"[YouTube] Searching highlights | home={home_team} | away={away_team} | "
+        f"date={match_date}"
+    )
 
     youtube = _get_youtube_client()
     queries = build_search_queries(home_team, away_team, match_date)
 
-    # 1) Try preferred channels in order
+    # 1) Try ALL preferred channels and aggregate
     channel_candidates: List[Dict[str, Any]] = []
     for channel_id in PREFERRED_CHANNEL_IDS:
         logger.info("Trying preferred channel: %s", channel_id)
+        print(f"[YouTube] Trying preferred channel: {channel_id}")
         items = _search_on_channel_with_queries(
             youtube=youtube,
             channel_id=channel_id,
@@ -500,17 +551,22 @@ def search_and_display_highlights_with_metadata(
             max_results=max_results * 2,  # grab a few extra for ranking
         )
         if items:
-            channel_candidates = items
-            break
+            channel_candidates.extend(items)
 
     if channel_candidates:
+        channel_candidates = _dedupe_by_video_id(channel_candidates)
         logger.info(
             "Using candidates from preferred channels (%d items)",
             len(channel_candidates),
         )
+        print(
+            f"[YouTube] Using {len(channel_candidates)} unique candidates "
+            f"from ALL preferred channels"
+        )
         candidates = channel_candidates
     else:
         logger.info("No channel hits; falling back to global YouTube search.")
+        print("[YouTube] No preferred-channel hits; falling back to GLOBAL search")
         candidates = _search_globally_with_queries(
             youtube=youtube,
             queries=queries,
@@ -531,7 +587,24 @@ def search_and_display_highlights_with_metadata(
     except Exception as e:
         # This ensures we NEVER bubble up things like "'list' object has no attribute 'split'"
         logger.exception("RAG validation failed (agent=%s): %s", AGENT_VERSION, e)
+        print(f"[YouTube] RAG validation failed: {e}")
         validated = candidates[:max_results]
 
     logger.info("Final validated highlight count: %d", len(validated))
+    print(f"[YouTube] Final validated highlight count: {len(validated)}")
+
+    # Optional: log the queries of the final picks clearly
+    for i, v in enumerate(validated, start=1):
+        logger.info(
+            "Final video %d | title=%s | query=%s | url=%s",
+            i,
+            v.get("title"),
+            v.get("search_query"),
+            v.get("url"),
+        )
+        print(
+            f"[YouTube] FINAL {i} | title='{v.get('title')}' | "
+            f"query='{v.get('search_query')}' | url={v.get('url')}"
+        )
+
     return validated

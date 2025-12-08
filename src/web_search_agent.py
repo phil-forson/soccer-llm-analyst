@@ -2,6 +2,7 @@
 Web search + RAG agent for finding football match information.
 
 - Uses DuckDuckGo (ddgs) for web search.
+- Optionally fetches full HTML from trusted sources and extracts main article text.
 - Optional embeddings-based RAG via Chroma.
 - Extracts match metadata deterministically (no JSON-from-LLM parsing).
 """
@@ -13,6 +14,13 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
 from urllib.parse import urlparse
+import json
+
+
+import logging
+
+import requests
+from requests.exceptions import RequestException
 
 from openai import OpenAI
 
@@ -29,10 +37,26 @@ try:
 except ImportError:
     print("[RAG] Note: embeddings_store not available, using simple context only")
 
+# Optional BeautifulSoup for better HTML parsing
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+    print("[RAG] Note: bs4 not installed, falling back to simple HTML stripping")
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
 # -----------------------------------------------------------------------------
 # Search configuration
 # -----------------------------------------------------------------------------
 MAX_RESULTS = 10
+MAX_ARTICLE_FETCH = 4  # how many full pages we fetch per search
+ARTICLE_TEXT_LIMIT = 12000  # max chars per article we keep
 
 TRUSTED_SOURCES = [
     "espn.com",
@@ -110,7 +134,172 @@ def _search_with_source(
 
 
 # -----------------------------------------------------------------------------
-# Deterministic metadata extraction
+# Full-page fetching and HTML → text
+# -----------------------------------------------------------------------------
+def _fetch_url(url: str, timeout: int = 8) -> Optional[str]:
+    """Fetch raw HTML from a URL."""
+    if not url.startswith("http"):
+        return None
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "en;q=0.9",
+    }
+
+    try:
+        logger.info("[RAG] Fetching article HTML from %s", url)
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            logger.warning(
+                "[RAG] Non-200 status for %s: %s", url, resp.status_code
+            )
+            return None
+        return resp.text
+    except RequestException as e:
+        logger.warning("[RAG] Error fetching %s: %s", url, e)
+        return None
+
+
+def _extract_main_text_from_html(html: str) -> str:
+    """
+    Extract main article text from HTML.
+
+    Prefer BeautifulSoup if available; otherwise a simple regex-based fallback.
+    """
+    if not html:
+        return ""
+
+    text = ""
+
+    if BS4_AVAILABLE:
+        soup = BeautifulSoup(html, "html.parser")
+        # Remove scripts/styles
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        # Heuristic: try <article>, then <main>, else full body
+        article = soup.find("article")
+        if article:
+            text = article.get_text(separator="\n", strip=True)
+        else:
+            main = soup.find("main")
+            if main:
+                text = main.get_text(separator="\n", strip=True)
+            else:
+                body = soup.body or soup
+                text = body.get_text(separator="\n", strip=True)
+    else:
+        # Very rough fallback: strip scripts/styles & tags
+        tmp = re.sub(
+            r"<script.*?</script>",
+            " ",
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        tmp = re.sub(
+            r"<style.*?</style>", " ", tmp, flags=re.DOTALL | re.IGNORECASE
+        )
+        tmp = re.sub(r"<[^>]+>", " ", tmp)
+        text = re.sub(r"\s+", " ", tmp).strip()
+
+    text = text.strip()
+    if len(text) > ARTICLE_TEXT_LIMIT:
+        text = text[:ARTICLE_TEXT_LIMIT]
+
+    logger.info(
+        "[RAG] Extracted %d characters of main text from HTML", len(text)
+    )
+    return text
+
+
+def _enrich_results_with_page_content(results: List[dict]) -> None:
+    """
+    For the top-ranked results, fetch full HTML and attach 'page_content'
+    to each result dict when successful.
+    """
+    fetched = 0
+    for r in results:
+        if fetched >= MAX_ARTICLE_FETCH:
+            break
+
+        url = r.get("url") or ""
+        if not url:
+            continue
+
+        dom = _domain_from_url(url)
+        if not any(dom.endswith(ts) for ts in TRUSTED_SOURCES):
+            # Only bother fetching from known football sources
+            continue
+
+        html = _fetch_url(url)
+        if not html:
+            continue
+
+        main_text = _extract_main_text_from_html(html)
+        if not main_text:
+            continue
+
+        r["page_content"] = main_text
+        fetched += 1
+        logger.info("[RAG] Attached page_content to result from %s", url)
+
+    logger.info("[RAG] Enriched %d result(s) with full article content", fetched)
+
+def _extract_score_from_answer_text(
+    answer_text: str,
+    context: str,
+    home_team: Optional[str],
+    away_team: Optional[str],
+) -> Optional[str]:
+    """
+    Extract a score like '3-1' from the LLM's answer, but only accept it if
+    the *same* score also appears in the raw context text.
+
+    This way we still do not trust the LLM blindly – it must match something
+    that existed in the scraped/snippet context.
+    """
+    if not answer_text:
+        return None
+
+    ans = answer_text.lower().replace("–", "-")
+    ctx = context.lower().replace("–", "-")
+
+    home = (home_team or "").lower()
+    away = (away_team or "").lower()
+
+    # Look for X-Y in the answer
+    for m in re.finditer(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", ans):
+        left = int(m.group(1))
+        right = int(m.group(2))
+        if left > 15 or right > 15:
+            continue
+
+        score = f"{left}-{right}"
+
+        # 1) Require the same score to exist in the raw context
+        if score not in ctx:
+            continue
+
+        # 2) Optionally require teams to appear near the score in the answer
+        window_start = max(0, m.start() - 80)
+        window_end = min(len(ans), m.end() + 80)
+        window = ans[window_start:window_end]
+
+        if home and home not in window:
+            continue
+        if away and away not in window:
+            continue
+
+        return score
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Deterministic metadata extraction (regex only)
 # -----------------------------------------------------------------------------
 def _extract_score_from_context(
     context: str, home_team: Optional[str], away_team: Optional[str]
@@ -286,21 +475,131 @@ def _maybe_correct_team_order_with_score(
     return home_team, away_team
 
 
+def _extract_goal_events_from_answer_text(
+    answer_text: str,
+    context: str,
+    home_team: Optional[str],
+    away_team: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Extract goal events from the *LLM summary text*.
+
+    We rely on patterns like:
+      • Jaka Bijol (6')
+      • Dominic Calvert-Lewin (72') for Leeds
+
+    To keep things grounded, we only keep a goal if the scorer's last name
+    also appears somewhere in the raw context.
+    """
+    if not answer_text:
+        return []
+
+    txt = answer_text
+    lower_ctx = context.lower().replace("–", "-")
+    home = (home_team or "").lower()
+    away = (away_team or "").lower()
+
+    # Allow optional bullet at the start and optional "for Team" at the end
+    pat = re.compile(
+        r"(?:^[\s•\-]*|\s)"                     # optional bullet / leading spaces
+        r"([A-Z][A-Za-z\-]+(?:\s[A-Z][A-Za-z\-]+)*)"  # player name (1–3 words, allows hyphens)
+        r"\s*\(\s*(\d{1,3})\s*['’]\s*\)"       # (minute')
+        r"(?:\s*for\s+([A-Za-z ]+))?",          # optional "for Team"
+        re.MULTILINE,
+    )
+
+    moments: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for m in pat.finditer(txt):
+        name = m.group(1).strip()
+        minute = m.group(2).strip()
+        team_raw = (m.group(3) or "").strip()
+
+        # Very light grounding: last name must appear in raw context
+        last_name = name.split()[-1].lower().replace("-", " ")
+        if last_name and last_name not in lower_ctx:
+            continue
+
+        # Try to map "for X" to home/away
+        team: Optional[str] = None
+        tr_low = team_raw.lower()
+        if home and tr_low and home in tr_low:
+            team = home_team
+        elif away and tr_low and away in tr_low:
+            team = away_team
+
+        key = (minute, name)
+        if key in moments:
+            continue
+
+        minute_label = f"{minute}'"
+        desc_team = team or "Unknown team"
+        description = f"GOAL for {desc_team}: {name} scores in the {minute}th minute."
+
+        moments[key] = {
+            "minute": minute_label,
+            "event": "Goal",
+            "description": description,
+            "team": team,
+        }
+
+    # Sort by minute
+    result = list(moments.values())
+    try:
+        result.sort(key=lambda x: int(re.sub(r"[^0-9]", "", x["minute"]) or 0))
+    except Exception:
+        pass
+
+    print(f"[RAG] Extracted {len(result)} goal events from LLM summary")
+    return result
+
+def _merge_goal_moments(
+    primary: List[Dict[str, Any]],
+    secondary: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge two goal lists, deduping by (minute, description).
+    Used if we want to combine regex-from-context and summary-based goals.
+    """
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def _add_all(lst: List[Dict[str, Any]]):
+        for g in lst:
+            key = (g.get("minute") or "", g.get("description") or "")
+            if key not in merged:
+                merged[key] = g
+
+    _add_all(primary)
+    _add_all(secondary)
+
+    out = list(merged.values())
+    try:
+        out.sort(key=lambda x: int(re.sub(r"[^0-9]", "", x.get("minute", "") or "0")))
+    except Exception:
+        pass
+    return out
+
+
+
 # -----------------------------------------------------------------------------
 # Goal / key-moment extraction
 # -----------------------------------------------------------------------------
 def _extract_goal_events_from_context(
-    context: str, home_team: Optional[str], away_team: Optional[str]
+    context: str,
+    home_team: Optional[str],
+    away_team: Optional[str],
+    score: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Extract goal events as key moments from article text.
 
-    Very conservative: only returns events when we see an explicit pattern,
-    e.g. "Bamford (23')" or "in the 23rd minute, Patrick Bamford scored".
+    Much more conservative:
 
-    Returns list of dicts:
-      { "minute": "23'", "event": "Goal",
-        "description": "...", "team": "Leeds" }
+    - Require 'goal' / 'scores' / 'scored' / 'header' / 'penalty' etc.
+      in the local window around the pattern.
+    - Require that we can confidently assign the scorer to one of the
+      two teams (otherwise drop the event).
+    - Optionally cap the number of events based on the final score.
     """
     if not context:
         return []
@@ -310,7 +609,22 @@ def _extract_goal_events_from_context(
     home = (home_team or "").lower()
     away = (away_team or "").lower()
 
-    moments: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # Rough upper bound on how many goals we expect
+    expected_goals: Optional[int] = None
+    if score and "-" in score:
+        try:
+            left, right = score.split("-", 1)
+            expected_goals = int(left) + int(right)
+        except ValueError:
+            expected_goals = None
+
+    goal_keywords = (
+        "goal", "scores", "scored", "nets", "netted",
+        "strike", "header", "penalty", "spot-kick",
+        "equaliser", "equalizer", "winner"
+    )
+
+    moments: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
     # Pattern 1: "Name (23')" or "Name (23rd minute)"
     pat1 = re.compile(
@@ -319,42 +633,59 @@ def _extract_goal_events_from_context(
     )
     # Pattern 2: "23rd-minute strike from Name" or "23rd minute from Name"
     pat2 = re.compile(
-        r"(\d{1,2})(?:st|nd|rd|th)?-?\s*minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)",
+        r"(\d{1,2})(?:st|nd|rd|th)?-?\s*minute[^\.]{0,80}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)",
         re.IGNORECASE | re.MULTILINE,
     )
     # Pattern 3: "in the 23rd minute, Name scored"
     pat3 = re.compile(
-        r"in the (\d{1,2})(?:st|nd|rd|th)? minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)",
+        r"in the (\d{1,2})(?:st|nd|rd|th)? minute[^\.]{0,80}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)",
         re.IGNORECASE | re.MULTILINE,
     )
 
-    def _infer_team_for_name(idx: int, scorer_name: str) -> Optional[str]:
+    def _infer_team_for_name(idx: int) -> Optional[str]:
         """
-        Look in a small window around idx to see if 'chelsea' or 'leeds'
-        is mentioned near the scorer.
+        Look in a small window around idx to see if only one of
+        home/away is mentioned -> assign that team.
         """
-        window_start = max(0, idx - 120)
-        window_end = min(len(lower), idx + 120)
+        window_start = max(0, idx - 140)
+        window_end = min(len(lower), idx + 140)
         window = lower[window_start:window_end]
 
-        if home and home in window and (not away or away not in window):
+        # Must actually talk about a goal / scoring in this window
+        if not any(kw in window for kw in goal_keywords):
+            return None
+
+        has_home = bool(home and home in window)
+        has_away = bool(away and away in window)
+
+        if has_home and not has_away:
             return home_team
-        if away and away in window and (not home or home not in window):
+        if has_away and not has_home:
             return away_team
+
         # If both or neither appear, do not guess.
         return None
 
-    # Helper to register a moment
     def _add_moment(minute: str, name: str, idx: int):
-        key = (minute, name)
+        # Ignore nonsense minutes
+        try:
+            m_int = int(minute)
+            if m_int <= 0 or m_int > 130:
+                return
+        except ValueError:
+            return
+
+        team = _infer_team_for_name(idx)
+        if not team:
+            # We only keep events we can confidently attach to a team
+            return
+
+        minute_label = f"{minute}'"
+        key = (minute_label, name, team)
         if key in moments:
             return
-        team = _infer_team_for_name(idx, name)
-        minute_label = f"{minute}'"
-        desc_team = team or "Unknown team"
-        description = (
-            f"GOAL for {desc_team}: {name} scores in the {minute}th minute."
-        )
+
+        description = f"GOAL for {team}: {name} scores in the {minute}th minute."
         moments[key] = {
             "minute": minute_label,
             "event": "Goal",
@@ -377,15 +708,123 @@ def _extract_goal_events_from_context(
         name = m.group(2).strip()
         _add_moment(minute, name, m.start())
 
-    # Sort by minute numerically
     result = list(moments.values())
+
+    # Sort by minute numerically
     try:
         result.sort(key=lambda x: int(re.sub(r"[^0-9]", "", x["minute"]) or 0))
     except Exception:
         pass
 
-    print(f"[WebSearch] Extracted {len(result)} goal events from context")
+    # If we know the final score, cap the number of goals
+    if expected_goals is not None and len(result) > expected_goals:
+        # Prefer to keep the earliest N goals (typical match report order)
+        result = result[:expected_goals]
+
+    print(f"[WebSearch] Extracted {len(result)} goal events from context (strict)")
     return result
+
+def _extract_goal_events_from_summary(
+    summary_text: str,
+    home_team: Optional[str],
+    away_team: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Use the LLM summary to extract goal events.
+
+    This is *stricter* than the main summariser:
+    - Only extract goals explicitly mentioned in the summary_text.
+    - Do NOT invent new players, teams or minutes.
+    - If unsure, return an empty list.
+    """
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        return []
+
+    client = _get_openai_client()
+
+    system_prompt = """
+You extract *only* explicit goal events from a football match summary.
+
+Rules:
+- Use ONLY information that appears in the provided summary text.
+- Do NOT invent new players, minutes, or team names.
+- If a detail (minute, team) is missing for a goal, set it to null.
+- If no goals are clearly described, return an empty list.
+
+Output JSON ONLY, with this exact shape:
+{
+  "events": [
+    {
+      "player": "Full Player Name",
+      "team": "Team Name or null",
+      "minute": "6'"  or null,
+      "description": "Short natural-language description of the goal"
+    },
+    ...
+  ]
+}
+"""
+
+    user_prompt = f"""Summary text:
+
+{summary_text}
+
+From this text, extract all goal events that are clearly described.
+Remember: if a goal is not clearly stated, do NOT include it.
+Return JSON only, conforming to the schema described above.
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model=DEFAULT_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            max_tokens=400,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content)
+    except Exception as e:
+        print(f"[WebSearch] LLM goal extraction error: {e}")
+        return []
+
+    events = data.get("events") or []
+    key_moments: List[Dict[str, Any]] = []
+
+    for ev in events:
+        player = (ev.get("player") or "").strip()
+        team = (ev.get("team") or None)
+        minute = (ev.get("minute") or None)
+        description = ev.get("description") or ""
+
+        if not player:
+            # If we do not even have a player name, skip.
+            continue
+
+        # Normalise minute string: ensure something like "6'" not "6"
+        if isinstance(minute, str) and minute and not minute.endswith("'"):
+            minute = minute + "'"
+
+        if not description:
+            if minute:
+                description = f"GOAL for {team or 'Unknown team'}: {player} scores in the {minute} minute."
+            else:
+                description = f"GOAL for {team or 'Unknown team'}: {player} scores."
+
+        key_moments.append(
+            {
+                "minute": minute,
+                "event": "Goal",
+                "description": description,
+                "team": team,
+            }
+        )
+
+    print(f"[WebSearch] Extracted {len(key_moments)} goal events from LLM summary")
+    return key_moments
 
 
 def _build_match_metadata_from_context(
@@ -412,7 +851,7 @@ def _build_match_metadata_from_context(
     )
 
     # goal → key_moments extraction
-    key_moments = _extract_goal_events_from_context(context, home_team, away_team)
+    key_moments = _extract_goal_events_from_context(context,home_team,away_team=away_team,score=raw_score)
 
     metadata = {
         "home_team": home_team,
@@ -440,9 +879,14 @@ def _build_match_metadata_from_context(
 def _chunk_search_results(results: List[dict], query_id: str) -> List[dict]:
     chunks: List[dict] = []
     for i, r in enumerate(results):
+        # Prefer full page_content if available; otherwise fall back to snippet
+        page_text = r.get("page_content") or ""
+        snippet = r.get("snippet", "") or ""
+        body = page_text if page_text else snippet
+
         text = (
             f"Title: {r.get('title','')}\n"
-            f"Content: {r.get('snippet','')}\n"
+            f"Content: {body}\n"
             f"Source: {r.get('url','')}"
         )
         chunks.append(
@@ -642,6 +1086,7 @@ def search_with_rag(
     """
     Full RAG pipeline:
     - web search (ddgs)
+    - select good URLs and (for some) fetch full HTML
     - chunk + optional embeddings index
     - retrieve most relevant chunks
     - summarise with LLM
@@ -707,6 +1152,9 @@ def search_with_rag(
     # Step 1b – rank results so true match pages come first
     all_results = _rank_match_results(all_results, home_team, away_team)
 
+    # NEW: fetch and attach full article content for top trusted results
+    _enrich_results_with_page_content(all_results)
+
     # Step 2 – chunk + index
     query_id = hashlib.md5(
         f"{biased_query}_{datetime.now().isoformat()}".encode()
@@ -764,10 +1212,59 @@ If the requested information is missing, say so clearly."""
         print(f"[RAG] LLM error during summary: {e}")
         answer_text = _format_raw_results(all_results)
 
-    # Deterministic metadata from the same context
+    # Deterministic metadata from the same context (regex only)
     metadata = _build_match_metadata_from_context(
         context, original_query, parsed_query
     )
+
+
+
+    # ---- NEW: fallback from summary if score missing ----
+    summary_score = _extract_score_from_answer_text(
+        answer_text=answer_text,
+        context=context,
+        home_team=home_team,
+        away_team=away_team,
+    )
+
+    if metadata.get("score") is None and summary_score:
+        print("[RAG] Filling missing score from LLM summary (validated against context)")
+        metadata["score"] = summary_score
+    # (optional) if you *really* want to override even when different:
+    # elif metadata.get("score") and summary_score and metadata["score"] != summary_score:
+    #     print("[RAG] Score mismatch; keeping deterministic score:", metadata["score"])
+        # Deterministic metadata from the same context (regex based)
+    metadata = _build_match_metadata_from_context(
+        context, original_query, parsed_query
+    )
+
+    # --- NEW: let the LLM summary refine score and key moments ---
+
+    # 1) If we can see a score in the LLM answer, prefer that over the raw HTML score.
+    try:
+        summary_score = _extract_score_from_context(
+            answer_text,
+            metadata.get("home_team"),
+            metadata.get("away_team"),
+        )
+        if summary_score:
+            metadata["score"] = summary_score
+    except Exception as e:
+        print(f"[WebSearch] Score extraction from summary failed: {e}")
+
+    # 2) Extract goal events from the summary text and override key_moments
+    try:
+        llm_key_moments = _extract_goal_events_from_summary(
+            answer_text,
+            metadata.get("home_team"),
+            metadata.get("away_team"),
+        )
+        if llm_key_moments:
+            metadata["key_moments"] = llm_key_moments
+    except Exception as e:
+        print(f"[WebSearch] LLM key-moment override failed: {e}")
+
+    # -----------------------------------------------------------
 
     # Append a compact source list
     srcs = {c.get("source", "") for c in relevant_chunks if c.get("source")}
@@ -777,6 +1274,9 @@ If the requested information is missing, say so clearly."""
             answer_text += f"\n  • {s}"
 
     return answer_text, metadata
+
+
+    
 
 
 # -----------------------------------------------------------------------------

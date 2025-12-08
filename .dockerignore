@@ -1,0 +1,63 @@
+# =============================================================================
+# Docker Ignore File
+# =============================================================================
+# Prevents unnecessary files from being copied into Docker image
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+venv
+.venv
+env
+.env
+*.env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+.cursor
+
+# Logs and databases (will be mounted as volumes)
+*.log
+*.db
+*.sqlite3
+chroma_db/
+data/
+logs/
+
+# Testing
+tests/
+test_*.py
+pytest.ini
+
+# Documentation (not needed in container)
+*.md
+docs/
+
+# Development files
+*.html
+thinking.log
+
+# OS files
+.DS_Store
+Thumbs.db
+

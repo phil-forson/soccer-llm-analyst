@@ -23,6 +23,8 @@ youtube-transcript-api>=0.6.0
 # Testing (optional)
 pytest>=7.0.0
 google-api-python-client>=2.0.0
+beautifulsoup4>=4.12.0
+
 
 # FastAPI for REST API
 fastapi>=0.104.0

@@ -1,0 +1,40 @@
+# =============================================================================
+# Soccer LLM Analyst - Docker Compose
+# =============================================================================
+# Easy deployment and local development configuration
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: soccer-llm-analyst
+    ports:
+      - "8000:8000"
+    environment:
+      # Required: Set these in .env file or directly here
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Optional: YouTube API key for enhanced video search
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
+    volumes:
+      # Persist ChromaDB data and logs
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# =============================================================================
+# Usage:
+# =============================================================================
+# 1. Create a .env file with your API keys (see .env.example)
+# 2. Run: docker-compose up -d
+# 3. Access API at: http://localhost:8000
+# 4. View docs at: http://localhost:8000/docs
+# 5. Stop: docker-compose down
+# =============================================================================
+
