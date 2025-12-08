@@ -12,6 +12,7 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -23,6 +24,7 @@ from .config import get_openai_key, DEFAULT_LLM_MODEL
 RAG_AVAILABLE = False
 try:
     from .embeddings_store import _get_embedding_model, _get_collection
+
     RAG_AVAILABLE = True
 except ImportError:
     print("[RAG] Note: embeddings_store not available, using simple context only")
@@ -34,8 +36,8 @@ MAX_RESULTS = 10
 
 TRUSTED_SOURCES = [
     "espn.com",
-    "bbc.com/sport",
-    "bbc.co.uk/sport",
+    "bbc.com",
+    "bbc.co.uk",
     "skysports.com",
     "goal.com",
     "flashscore.com",
@@ -43,7 +45,7 @@ TRUSTED_SOURCES = [
     "whoscored.com",
     "fotmob.com",
     "premierleague.com",
-    "theguardian.com/football",
+    "theguardian.com",
 ]
 
 # -----------------------------------------------------------------------------
@@ -66,9 +68,21 @@ def _safe_lower(value: Any) -> str:
     return str(value).lower() if value is not None else ""
 
 
-def _search_with_source(query: str,
-                        source: Optional[str] = None,
-                        max_results: int = 10) -> List[Dict[str, str]]:
+def _domain_from_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        netloc = urlparse(url).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def _search_with_source(
+    query: str, source: Optional[str] = None, max_results: int = 10
+) -> List[Dict[str, str]]:
     """Search ddgs with optional site restriction."""
     try:
         from ddgs import DDGS
@@ -82,11 +96,13 @@ def _search_with_source(query: str,
     try:
         with DDGS() as ddgs:
             for r in ddgs.text(search_query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", "") or "",
-                    "snippet": r.get("body", "") or "",
-                    "url": r.get("href", "") or "",
-                })
+                results.append(
+                    {
+                        "title": r.get("title", "") or "",
+                        "snippet": r.get("body", "") or "",
+                        "url": r.get("href", "") or "",
+                    }
+                )
     except Exception as e:
         print(f"[WebSearch] Search error for {source or 'general'}: {e}")
 
@@ -96,9 +112,9 @@ def _search_with_source(query: str,
 # -----------------------------------------------------------------------------
 # Deterministic metadata extraction
 # -----------------------------------------------------------------------------
-def _extract_score_from_context(context: str,
-                                home_team: Optional[str],
-                                away_team: Optional[str]) -> Optional[str]:
+def _extract_score_from_context(
+    context: str, home_team: Optional[str], away_team: Optional[str]
+) -> Optional[str]:
     """
     Deterministically extract a score 'X-Y' from context.
     Prefer scores that appear near the expected teams.
@@ -112,8 +128,15 @@ def _extract_score_from_context(context: str,
 
     score_hits: Dict[str, Dict[str, int]] = {}
 
-    for match in re.finditer(r'(\d{1,2})\s*-\s*(\d{1,2})', text):
-        score = f"{match.group(1)}-{match.group(2)}"
+    for match in re.finditer(r"(\d{1,2})\s*-\s*(\d{1,2})", text):
+        left = int(match.group(1))
+        right = int(match.group(2))
+
+        # Hard cap: football scores rarely exceed this on either side
+        if left > 15 or right > 15:
+            continue
+
+        score = f"{left}-{right}"
         window_start = max(0, match.start() - 80)
         window_end = min(len(text), match.end() + 80)
         window = text[window_start:window_end]
@@ -154,9 +177,9 @@ def _extract_date_from_context(context: str, query: str) -> Optional[str]:
 
     try:
         patterns = [
-            r'(\d{4}-\d{2}-\d{2})',
-            r'(\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})',
-            r'((January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})',
+            r"(\d{4}-\d{2}-\d{2})",
+            r"(\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})",
+            r"((January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})",
         ]
 
         candidates: List[Tuple[datetime, str]] = []
@@ -217,10 +240,12 @@ def _resolve_expected_teams(parsed_query: Optional[dict]) -> Tuple[Optional[str]
     return home_team, away_team
 
 
-def _maybe_correct_team_order_with_score(context: str,
-                                         score: Optional[str],
-                                         home_team: Optional[str],
-                                         away_team: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def _maybe_correct_team_order_with_score(
+    context: str,
+    score: Optional[str],
+    home_team: Optional[str],
+    away_team: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Fix cases like:
       - query: "chelsea leeds"
@@ -253,7 +278,9 @@ def _maybe_correct_team_order_with_score(context: str,
 
     # If only the reversed ordering appears, swap
     if away_first and not home_first:
-        print("[WebSearch] Detected score pattern with reversed team order – swapping home/away")
+        print(
+            "[WebSearch] Detected score pattern with reversed team order – swapping home/away"
+        )
         return away_team, home_team
 
     return home_team, away_team
@@ -262,9 +289,9 @@ def _maybe_correct_team_order_with_score(context: str,
 # -----------------------------------------------------------------------------
 # Goal / key-moment extraction
 # -----------------------------------------------------------------------------
-def _extract_goal_events_from_context(context: str,
-                                      home_team: Optional[str],
-                                      away_team: Optional[str]) -> List[Dict[str, Any]]:
+def _extract_goal_events_from_context(
+    context: str, home_team: Optional[str], away_team: Optional[str]
+) -> List[Dict[str, Any]]:
     """
     Extract goal events as key moments from article text.
 
@@ -287,17 +314,17 @@ def _extract_goal_events_from_context(context: str,
 
     # Pattern 1: "Name (23')" or "Name (23rd minute)"
     pat1 = re.compile(
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s*\(\s*(\d{1,2})\s*(?:\'|’)?',
+        r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s*\(\s*(\d{1,2})\s*(?:'|’)?",
         re.MULTILINE,
     )
     # Pattern 2: "23rd-minute strike from Name" or "23rd minute from Name"
     pat2 = re.compile(
-        r'(\d{1,2})(?:st|nd|rd|th)?-?\s*minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
+        r"(\d{1,2})(?:st|nd|rd|th)?-?\s*minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)",
         re.IGNORECASE | re.MULTILINE,
     )
     # Pattern 3: "in the 23rd minute, Name scored"
     pat3 = re.compile(
-        r'in the (\d{1,2})(?:st|nd|rd|th)? minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
+        r"in the (\d{1,2})(?:st|nd|rd|th)? minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)",
         re.IGNORECASE | re.MULTILINE,
     )
 
@@ -325,7 +352,9 @@ def _extract_goal_events_from_context(context: str,
         team = _infer_team_for_name(idx, name)
         minute_label = f"{minute}'"
         desc_team = team or "Unknown team"
-        description = f"GOAL for {desc_team}: {name} scores in the {minute}th minute."
+        description = (
+            f"GOAL for {desc_team}: {name} scores in the {minute}th minute."
+        )
         moments[key] = {
             "minute": minute_label,
             "event": "Goal",
@@ -359,9 +388,9 @@ def _extract_goal_events_from_context(context: str,
     return result
 
 
-def _build_match_metadata_from_context(context: str,
-                                       original_query: str,
-                                       parsed_query: Optional[dict]) -> dict:
+def _build_match_metadata_from_context(
+    context: str, original_query: str, parsed_query: Optional[dict]
+) -> dict:
     """
     Deterministic metadata:
     - home_team / away_team start from parsed_query
@@ -382,7 +411,7 @@ def _build_match_metadata_from_context(context: str,
         away_team=away_team,
     )
 
-    # NEW: goal → key_moments extraction
+    # goal → key_moments extraction
     key_moments = _extract_goal_events_from_context(context, home_team, away_team)
 
     metadata = {
@@ -411,17 +440,23 @@ def _build_match_metadata_from_context(context: str,
 def _chunk_search_results(results: List[dict], query_id: str) -> List[dict]:
     chunks: List[dict] = []
     for i, r in enumerate(results):
-        text = f"Title: {r.get('title','')}\nContent: {r.get('snippet','')}\nSource: {r.get('url','')}"
-        chunks.append({
-            "id": f"{query_id}_{i}",
-            "text": text,
-            "metadata": {
-                "query_id": query_id,
-                "source_url": r.get("url", ""),
-                "title": r.get("title", ""),
-                "chunk_index": i,
+        text = (
+            f"Title: {r.get('title','')}\n"
+            f"Content: {r.get('snippet','')}\n"
+            f"Source: {r.get('url','')}"
+        )
+        chunks.append(
+            {
+                "id": f"{query_id}_{i}",
+                "text": text,
+                "metadata": {
+                    "query_id": query_id,
+                    "source_url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "chunk_index": i,
+                },
             }
-        })
+        )
     return chunks
 
 
@@ -443,10 +478,9 @@ def _index_chunks_for_rag(chunks: List[dict]) -> None:
         print(f"[RAG] Indexing error: {e}")
 
 
-def _retrieve_relevant_context(query: str,
-                               query_id: str,
-                               chunks: List[dict],
-                               k: int = 5) -> List[dict]:
+def _retrieve_relevant_context(
+    query: str, query_id: str, chunks: List[dict], k: int = 5
+) -> List[dict]:
     if RAG_AVAILABLE:
         try:
             collection = _get_collection()
@@ -462,28 +496,115 @@ def _retrieve_relevant_context(query: str,
             retrieved: List[dict] = []
             if res["documents"] and res["documents"][0]:
                 for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
-                    retrieved.append({
-                        "text": doc,
-                        "source": meta.get("source_url", ""),
-                        "title": meta.get("title", ""),
-                    })
+                    retrieved.append(
+                        {
+                            "text": doc,
+                            "source": meta.get("source_url", ""),
+                            "title": meta.get("title", ""),
+                        }
+                    )
             print(f"[RAG] Retrieved {len(retrieved)} chunks via embeddings")
             return retrieved
         except Exception as e:
             print(f"[RAG] Retrieval error: {e} – falling back to simple context")
 
     print("[RAG] Using simple context (no embeddings)")
-    return [{
-        "text": c["text"],
-        "source": c["metadata"].get("source_url", ""),
-        "title": c["metadata"].get("title", "")
-    } for c in chunks[:k]]
+    return [
+        {
+            "text": c["text"],
+            "source": c["metadata"].get("source_url", ""),
+            "title": c["metadata"].get("title", ""),
+        }
+        for c in chunks[:k]
+    ]
+
+
+# -----------------------------------------------------------------------------
+# Result ranking to avoid “team overview” pages
+# -----------------------------------------------------------------------------
+def _rank_match_results(
+    results: List[dict], home_team: Optional[str], away_team: Optional[str]
+) -> List[dict]:
+    """
+    Heuristically rank web results so that actual match reports/score pages
+    float to the top, and generic team overview/fixtures pages are pushed down.
+    """
+    home = (home_team or "").lower()
+    away = (away_team or "").lower()
+
+    def _score_result(r: dict) -> int:
+        title = (r.get("title") or "").lower()
+        snippet = (r.get("snippet") or "").lower()
+        url = (r.get("url") or "").lower()
+        text = f"{title} {snippet}"
+
+        score = 0
+
+        # 1) Do we see home/away names?
+        has_home = bool(home and home in text)
+        has_away = bool(away and away in text)
+
+        if has_home:
+            score += 10
+        if has_away:
+            score += 10
+        if has_home and has_away:
+            score += 20  # both teams mentioned somewhere is good
+
+        # 2) Patterns like "leeds vs chelsea" or 'leeds 3-1 chelsea'
+        if home and away:
+            vs_pattern = rf"{home}.*(vs|v|v\.)\s*{away}|{away}.*(vs|v|v\.)\s*{home}"
+            score_pattern = (
+                rf"{home}.*\d+\s*[-–]\s*\d+.*{away}"
+                rf"|{away}.*\d+\s*[-–]\s*\d+.*{home}"
+            )
+            if re.search(vs_pattern, text):
+                score += 25
+            if re.search(score_pattern, text):
+                score += 25
+
+        # 3) Trusted domains bump
+        dom = _domain_from_url(url)
+        if any(dom.endswith(ts) for ts in TRUSTED_SOURCES):
+            score += 10
+
+        # 4) Penalise “generic” pages (overview, fixtures, tables, etc.)
+        generic_words = [
+            "overview",
+            "team",
+            "teams",
+            "fixtures",
+            "fixture",
+            "schedule",
+            "schedules",
+            "table",
+            "tables",
+            "results",
+        ]
+        if any(w in url for w in generic_words) or any(
+            w in title for w in generic_words
+        ):
+            if not (has_home and has_away):
+                score -= 40  # generic team page with only one side
+            else:
+                score -= 10  # slightly penalise even if both sides are present
+
+        return score
+
+    ranked = sorted(results, key=_score_result, reverse=True)
+
+    # Debug: see what we are doing
+    print("[RAG] Step 1b: ranked results (top 5)")
+    for r in ranked[:5]:
+        print("   •", r.get("title"), "=>", r.get("url"))
+
+    return ranked
 
 
 # -----------------------------------------------------------------------------
 # Intent-specific instructions for LLM summarisation
 # -----------------------------------------------------------------------------
-def _get_intent_instructions(intent: str, summary_focus: str) -> str:
+def _get_intent_instructions(intent: str, summary_focus: Optional[str]) -> str:
     base = {
         "match_result": """Focus on:
 - final score
@@ -500,7 +621,10 @@ def _get_intent_instructions(intent: str, summary_focus: str) -> str:
         "transfer_news": """Focus on:
 - confirmed transfers and serious rumours
 - fees / contract details if present""",
-    }.get(intent, "Provide a concise, factual summary of the retrieved information.")
+    }.get(
+        intent,
+        "Provide a concise, factual summary of the retrieved information.",
+    )
 
     return base + f"\n\nUser requested focus: {summary_focus or 'key information'}."
 
@@ -513,6 +637,7 @@ def search_with_rag(
     intent: str,
     original_query: str,
     parsed_query: Optional[dict] = None,
+    summary_focus: Optional[str] = None,
 ) -> tuple[str, dict]:
     """
     Full RAG pipeline:
@@ -538,9 +663,9 @@ def search_with_rag(
         year = datetime.now().year
         biased_query = f"{query} latest match result score {year} men"
 
-    print(f"[RAG] Biased query: \"{biased_query}\"")
+    print(f'[RAG] Biased query: "{biased_query}"')
     if parsed_query:
-        print(f"[RAG] Parsed query:")
+        print("[RAG] Parsed query:")
         print(f"  Intent: {parsed_query.get('intent')}")
         print(f"  Teams:  {parsed_query.get('teams')}")
         print(f"  Competition: {parsed_query.get('competition')}")
@@ -579,14 +704,21 @@ def search_with_rag(
         }
         return f"❌ No results found for: {original_query}", metadata
 
+    # Step 1b – rank results so true match pages come first
+    all_results = _rank_match_results(all_results, home_team, away_team)
+
     # Step 2 – chunk + index
-    query_id = hashlib.md5(f"{biased_query}_{datetime.now().isoformat()}".encode()).hexdigest()[:12]
+    query_id = hashlib.md5(
+        f"{biased_query}_{datetime.now().isoformat()}".encode()
+    ).hexdigest()[:12]
     chunks = _chunk_search_results(all_results, query_id)
     _index_chunks_for_rag(chunks)
     print(f"[RAG] Step 2: chunked {len(chunks)} results")
 
     # Step 3 – retrieve relevant context
-    relevant_chunks = _retrieve_relevant_context(original_query, query_id, chunks, k=5)
+    relevant_chunks = _retrieve_relevant_context(
+        original_query, query_id, chunks, k=5
+    )
     print(f"[RAG] Step 3: using {len(relevant_chunks)} chunks as context")
 
     context = "\n\n".join(
@@ -595,7 +727,7 @@ def search_with_rag(
 
     # Step 4 – LLM summary (STRICT: no fabrication)
     client = _get_openai_client()
-    intent_instructions = _get_intent_instructions(intent, "key information")
+    intent_instructions = _get_intent_instructions(intent, summary_focus)
 
     system_prompt = f"""You are a football/soccer information assistant using RAG.
 
@@ -633,7 +765,9 @@ If the requested information is missing, say so clearly."""
         answer_text = _format_raw_results(all_results)
 
     # Deterministic metadata from the same context
-    metadata = _build_match_metadata_from_context(context, original_query, parsed_query)
+    metadata = _build_match_metadata_from_context(
+        context, original_query, parsed_query
+    )
 
     # Append a compact source list
     srcs = {c.get("source", "") for c in relevant_chunks if c.get("source")}
@@ -669,9 +803,15 @@ def search_and_summarize_with_intent(
     parsed_query: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """
-    Backwards-compatible wrapper that just calls search_with_rag.
+    Backwards-compatible wrapper around search_with_rag.
     """
-    return search_with_rag(search_query, intent, original_query, parsed_query)
+    return search_with_rag(
+        search_query,
+        intent=intent,
+        original_query=original_query,
+        parsed_query=parsed_query,
+        summary_focus=summary_focus,
+    )
 
 
 def search_and_summarize(query: str, use_llm: bool = True) -> str:
@@ -679,5 +819,11 @@ def search_and_summarize(query: str, use_llm: bool = True) -> str:
     Simple wrapper if something still calls the old API.
     Assumes match_result intent.
     """
-    answer, _ = search_with_rag(query, intent="match_result", original_query=query, parsed_query=None)
+    answer, _ = search_with_rag(
+        query,
+        intent="match_result",
+        original_query=query,
+        parsed_query=None,
+        summary_focus=None,
+    )
     return answer

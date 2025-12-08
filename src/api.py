@@ -76,9 +76,6 @@ def _log_thinking(stage: str, message: str, status: str, data: Optional[Dict] = 
     thinking_logger.info(log_msg)
 
 
-# Team logo function is now imported from team_logos.py
-
-
 # =============================================================================
 # FastAPI App Setup
 # =============================================================================
@@ -278,6 +275,73 @@ def _parse_highlights_output(highlights_text: str) -> List[HighlightVideo]:
             pass
     
     return videos
+
+
+def _normalise_highlight_results(raw: Any) -> List[HighlightVideo]:
+    """
+    Normalise whatever the highlights agent returns into a list[HighlightVideo].
+
+    - If `raw` is a string: treat it as the old formatted text and parse it.
+    - If `raw` is a list[dict]: treat each dict as YouTube metadata from youtube_search_agent.
+    - If `raw` is already a list[HighlightVideo], just return it.
+    """
+    # Case 1: old behaviour – formatted text
+    if isinstance(raw, str):
+        return _parse_highlights_output(raw)
+
+    videos: List[HighlightVideo] = []
+
+    # Case 2: already our Pydantic models
+    if isinstance(raw, list) and raw and isinstance(raw[0], HighlightVideo):
+        return raw
+
+    # Case 3: list of dicts from youtube_search_agent
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, HighlightVideo):
+                videos.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            video_id = item.get("video_id") or item.get("videoId")
+            url = item.get("url")
+            if not url and video_id:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+
+            title = item.get("title") or ""
+            channel_title = (
+                item.get("channel_title")
+                or item.get("channelTitle")
+                or ""
+            )
+            source_type = item.get("source_type") or None
+
+            # Simple heuristics
+            ct_lower = channel_title.lower()
+            is_nbc = "nbc sports" in ct_lower or "nbcsports" in ct_lower
+            is_official = "official" in ct_lower or " fc" in ct_lower or " cf" in ct_lower
+
+            try:
+                videos.append(
+                    HighlightVideo(
+                        title=title,
+                        url=url or "",
+                        duration=None,          # Wire later if you add duration
+                        source_type=source_type,
+                        is_nbc_sports=is_nbc,
+                        is_official_club=is_official,
+                        confidence=None,        # Wire ranking scores later if needed
+                    )
+                )
+            except Exception:
+                # Defensive: skip broken entries
+                continue
+
+        return videos
+
+    # Fallback
+    return []
 
 
 def _extract_sources_from_summary(summary: str) -> List[str]:
@@ -662,7 +726,7 @@ async def _process_query_with_thinking(request: QueryRequest):
                     game_analysis_data = None
         
         # Step 4: Highlights (LAST in chain)
-        highlights = []
+        highlights: List[HighlightVideo] = []
         if show_highlights:
             try:
                 home_team = match_metadata.get("home_team") or (parsed.get("teams", [None])[0])
@@ -674,14 +738,14 @@ async def _process_query_with_thinking(request: QueryRequest):
                     yield _send_thinking("highlights", f"Searching for highlight videos: {home_team} vs {away_team}...", "starting", {"home_team": home_team, "away_team": away_team})
                     yield _send_thinking("highlights", "Validating videos using RAG against match context...", "processing", {"action": "rag_validation"})
                     
-                    highlights_text = search_and_display_highlights_with_metadata(
+                    raw_highlights = search_and_display_highlights_with_metadata(
                         home_team=home_team,
                         away_team=away_team,
                         match_date=match_date,
                         web_summary=web_summary,
                         match_metadata=match_metadata
                     )
-                    highlights = _parse_highlights_output(highlights_text)
+                    highlights = _normalise_highlight_results(raw_highlights)
                     
                     # Extract source types safely (handles both dicts and HighlightVideo objects)
                     sources_list = []
@@ -1008,7 +1072,7 @@ async def query_endpoint(request: QueryRequest):
         
         # Step 4: Highlights (LAST in chain - uses all previous results)
         # Chain: Query Parser → Web Search → Game Analyst → Highlights
-        highlights = []
+        highlights: List[HighlightVideo] = []
         if show_highlights:
             try:
                 print(f"\n[API] Step 4: Chaining to Highlights Agent (last step)...")
@@ -1018,14 +1082,14 @@ async def query_endpoint(request: QueryRequest):
                 
                 if home_team:
                     # Pass web_summary and match_metadata for RAG validation
-                    highlights_text = search_and_display_highlights_with_metadata(
+                    raw_highlights = search_and_display_highlights_with_metadata(
                         home_team=home_team,
                         away_team=away_team,
                         match_date=match_date,
                         web_summary=web_summary,  # From web search agent
                         match_metadata=match_metadata  # From web search agent
                     )
-                    highlights = _parse_highlights_output(highlights_text)
+                    highlights = _normalise_highlight_results(raw_highlights)
                     print(f"[API] ✓ Highlights complete (chained from web search + game analysis)")
             except Exception as e:
                 # Don't fail the whole request if highlights fail
@@ -1138,7 +1202,7 @@ async def analyze_match_endpoint(request: QueryRequest):
         
         # Step 3: Highlights (LAST in chain - uses all previous results)
         # Chain: Query Parser → Web Search → Game Analyst → Highlights
-        highlights = []
+        highlights: List[HighlightVideo] = []
         if request.include_highlights if request.include_highlights is not None else True:
             try:
                 print(f"\n[API] Step 3: Chaining to Highlights Agent (last step)...")
@@ -1148,17 +1212,18 @@ async def analyze_match_endpoint(request: QueryRequest):
                 
                 if home_team:
                     # Pass web_summary and match_metadata for RAG validation
-                    highlights_text = search_and_display_highlights_with_metadata(
+                    raw_highlights = search_and_display_highlights_with_metadata(
                         home_team=home_team,
                         away_team=away_team,
                         match_date=match_date,
                         web_summary=web_summary,  # From web search agent
                         match_metadata=match_metadata  # From web search agent
                     )
-                    highlights = _parse_highlights_output(highlights_text)
+                    highlights = _normalise_highlight_results(raw_highlights)
                     print(f"[API] ✓ Highlights complete (chained from web search + game analysis)")
             except Exception as e:
                 print(f"[API] ⚠️ Highlights failed: {e}")
+                highlights = []
         
         if not analysis.get('success'):
             return GameAnalysisResponse(
@@ -1176,11 +1241,6 @@ async def analyze_match_endpoint(request: QueryRequest):
             KeyMoment(**moment) for moment in analysis.get('key_moments', [])
         ]
         
-        # Convert highlights to models (from the highlights we fetched separately)
-        highlight_models = [
-            HighlightVideo(**video) for video in highlights
-        ]
-        
         return GameAnalysisResponse(
             success=True,
             match_info=analysis.get('match_info'),
@@ -1188,7 +1248,7 @@ async def analyze_match_endpoint(request: QueryRequest):
             momentum_analysis=momentum_shifts,
             tactical_analysis=analysis.get('tactical_analysis'),
             key_moments=key_moments,
-            highlights=highlight_models,
+            highlights=highlights,
         )
         
     except Exception as e:
@@ -1222,4 +1282,3 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
 if __name__ == "__main__":
     # Run server when executed directly
     run_server(host="0.0.0.0", port=8000, reload=True)
-
