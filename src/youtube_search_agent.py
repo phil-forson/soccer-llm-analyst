@@ -1,17 +1,11 @@
 import os
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Union
 
+import re
 from googleapiclient.discovery import build
-
-# Optional DuckDuckGo search (credit-free fallback)
-try:
-    from ddgs import DDGS  # duckduckgo-search
-    DDG_AVAILABLE = True
-except ImportError:
-    DDG_AVAILABLE = False
+from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 
@@ -22,52 +16,36 @@ logger = logging.getLogger(__name__)
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 if not YOUTUBE_API_KEY:
-    logger.warning("YOUTUBE_API_KEY is not set. YouTube search will fail.")
+    logger.warning("YOUTUBE_API_KEY is not set. YouTube search will be skipped and DDG fallback will be used.")
 
-# Generic preferred channels (used only as a last-resort fallback)
-PREFERRED_CHANNEL_IDS: List[str] = [
-    "UC6c1z7bA__85CIWZ_jpCK-Q",  # ESPN
-    "UCqZQlzSHbVJrwrn5XvzrzcA",  # NBC Sports
-    "UCET00YnetHT7tOpu12v8jxg",  # CBS Sports
-]
+# Known channels
+ESPN_CHANNEL_ID = "UC6c1z7bA__85CIWZ_jpCK-Q"   # ESPN
+NBC_CHANNEL_ID = "UCqZQlzSHbVJrwrn5XvzrzcA"   # NBC Sports
+CBS_CHANNEL_ID = "UCET00YnetHT7tOpu12v8jxg"   # CBS Sports
 
-# Competition → best YouTube channels to query first
-# (Use IDs we actually know, reusing from PREFERRED_CHANNEL_IDS)
-COMPETITION_CHANNEL_MAP: Dict[str, List[str]] = {
-    # Premier League highlights (US rights)
-    "premier league": ["UCqZQlzSHbVJrwrn5XvzrzcA"],  # NBC Sports
-    # UEFA Champions League (US)
-    "champions league": ["UCET00YnetHT7tOpu12v8jxg"],  # CBS Sports
-    "uefa champions league": ["UCET00YnetHT7tOpu12v8jxg"],
-    # La Liga (global, often ESPN FC)
-    "la liga": ["UC6c1z7bA__85CIWZ_jpCK-Q"],  # ESPN
-    "laliga": ["UC6c1z7bA__85CIWZ_jpCK-Q"],
-}
-
-# Competition → broadcaster “brand names” to bias DDG queries
-COMPETITION_BRANDS_MAP: Dict[str, List[str]] = {
-    "premier league": ["NBC Sports"],
-    "champions league": ["CBS Sports", "TNT Sports", "BT Sport"],
-    "uefa champions league": ["CBS Sports", "TNT Sports", "BT Sport"],
-    "la liga": ["ESPN FC"],
-    "laliga": ["ESPN FC"],
-}
-
-AGENT_VERSION = "youtube_search_agent_v6_competitions_ddg_2025-12-08"
+AGENT_VERSION = "youtube_search_agent_v7_competition_aware_quota_safe_2025-12-08"
 
 
 # ---------------------------------------------------------------------------
-# BASIC HELPERS
+# HELPERS
 # ---------------------------------------------------------------------------
 
 def _get_youtube_client():
+    """
+    Safe YouTube client initialiser.
+
+    - If no API key, returns None (do not raise).
+    - If build fails, returns None.
+    """
     if not YOUTUBE_API_KEY:
-        raise RuntimeError(
-            "YOUTUBE_API_KEY environment variable is not set. "
-            "Set it in your .env or shell before running the server."
-        )
-    logger.info("Initialising YouTube client | agent_version=%s", AGENT_VERSION)
-    return build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+        logger.warning("YOUTUBE_API_KEY missing; YouTube client disabled, will use DDG fallback.")
+        return None
+    try:
+        logger.info("Initialising YouTube client | agent_version=%s", AGENT_VERSION)
+        return build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    except Exception as e:
+        logger.warning("Failed to initialise YouTube client (%s). Will use DDG fallback.", e)
+        return None
 
 
 def _safe_parse_date(value: Optional[Union[str, datetime]]) -> Optional[datetime]:
@@ -85,44 +63,53 @@ def _safe_parse_date(value: Optional[Union[str, datetime]]) -> Optional[datetime
     return None
 
 
-def _select_channels_for_competition(competition: Optional[str]) -> List[str]:
+def _competition_profile(competition: Optional[str]) -> Dict[str, Any]:
     """
-    Choose the most relevant YouTube channels based on the competition name.
-    """
-    if not competition:
-        return []
-    comp = competition.lower()
-    for key, channels in COMPETITION_CHANNEL_MAP.items():
-        if key in comp:
-            logger.info(
-                "Competition '%s' matched key '%s' -> channels=%s",
-                competition,
-                key,
-                channels,
-            )
-            print(f"[YouTube] competition '{competition}' → channels {channels}")
-            return channels
-    return []
+    Decide which channels and fallback domains to prefer based on competition.
 
+    Returns:
+        {
+          "primary_channels": [channel_ids...],
+          "secondary_channels": [channel_ids...],
+          "ddg_domains": [domains...],
+        }
+    """
+    comp = (competition or "").lower()
 
-def _select_brands_for_competition(competition: Optional[str]) -> List[str]:
-    """
-    Choose broadcaster brand strings to bias DDG queries for this competition.
-    """
-    if not competition:
-        return []
-    comp = competition.lower()
-    for key, brands in COMPETITION_BRANDS_MAP.items():
-        if key in comp:
-            logger.info(
-                "Competition '%s' matched key '%s' for DDG brands -> %s",
-                competition,
-                key,
-                brands,
-            )
-            print(f"[DDG] competition '{competition}' → brands {brands}")
-            return brands
-    return []
+    # Champions League
+    if any(k in comp for k in ["champions league", "ucl", "uefa champions"]):
+        logger.info("Competition profile: Champions League – prioritising CBS, then ESPN/NBC")
+        return {
+            "primary_channels": [CBS_CHANNEL_ID],
+            "secondary_channels": [ESPN_CHANNEL_ID, NBC_CHANNEL_ID],
+            "ddg_domains": ["cbssports.com", "uefa.com", "youtube.com"],
+        }
+
+    # Premier League
+    if any(k in comp for k in ["premier league", "epl", "english premier"]):
+        logger.info("Competition profile: Premier League – prioritising NBC, then ESPN")
+        return {
+            "primary_channels": [NBC_CHANNEL_ID],
+            "secondary_channels": [ESPN_CHANNEL_ID, CBS_CHANNEL_ID],
+            "ddg_domains": ["nbcsports.com", "premierleague.com", "youtube.com"],
+        }
+
+    # La Liga
+    if "la liga" in comp:
+        logger.info("Competition profile: La Liga – prioritising ESPN")
+        return {
+            "primary_channels": [ESPN_CHANNEL_ID],
+            "secondary_channels": [CBS_CHANNEL_ID, NBC_CHANNEL_ID],
+            "ddg_domains": ["espn.com", "youtube.com"],
+        }
+
+    # Default / unknown competition
+    logger.info("Competition profile: Default – ESPN, NBC, CBS")
+    return {
+        "primary_channels": [ESPN_CHANNEL_ID, NBC_CHANNEL_ID],
+        "secondary_channels": [CBS_CHANNEL_ID],
+        "ddg_domains": ["youtube.com"],
+    }
 
 
 def build_search_queries(
@@ -133,19 +120,20 @@ def build_search_queries(
 ) -> List[str]:
     """
     Build a set of queries for the highlights search.
+    We include competition name (if any) to nudge YouTube / DDG towards the right game.
     """
     dt = _safe_parse_date(match_date)
+    comp = (competition or "").strip()
+
     base1 = f"{home_team} vs {away_team} highlights"
     base2 = f"{home_team} {away_team} extended highlights"
     base3 = f"{home_team} {away_team} goals"
 
     queries: List[str] = [base1, base2, base3]
 
-    # Add competition to some variants if known
-    if competition:
-        comp = competition.strip()
+    if comp:
         queries.append(f"{base1} {comp}")
-        queries.append(f"{home_team} vs {away_team} {comp} highlights")
+        queries.append(f"{home_team} vs {away_team} {comp} full highlights")
 
     if dt:
         date_str_ymd = dt.strftime("%Y-%m-%d")
@@ -153,6 +141,8 @@ def build_search_queries(
         queries.append(f"{base1} {date_str_ymd}")
         queries.append(f"{base1} {date_str_dmy}")
         queries.append(f"{home_team} {away_team} highlights {date_str_ymd}")
+        if comp:
+            queries.append(f"{home_team} vs {away_team} {comp} {date_str_ymd}")
 
     # Deduplicate while preserving order
     seen = set()
@@ -162,14 +152,13 @@ def build_search_queries(
             seen.add(q)
             uniq_queries.append(q)
 
-    logger.info("Highlight search queries (agent=%s): %s", AGENT_VERSION, uniq_queries)
-    print(f"[YouTube] highlight queries: {uniq_queries}")
+    logger.info(
+        "Highlight search queries (agent=%s): %s",
+        AGENT_VERSION,
+        uniq_queries,
+    )
     return uniq_queries
 
-
-# ---------------------------------------------------------------------------
-# YOUTUBE LOW-LEVEL SEARCH
-# ---------------------------------------------------------------------------
 
 def _search_youtube(
     youtube,
@@ -177,14 +166,21 @@ def _search_youtube(
     channel_id: Optional[str] = None,
     published_after: Optional[datetime] = None,
     published_before: Optional[datetime] = None,
-    max_results: int = 10,
+    max_results: int = 5,
 ) -> List[Dict[str, Any]]:
     """
     Low-level YouTube search.
 
-    IMPORTANT: Every returned item carries `"search_query": query`
-    so you can see which text produced that result.
+    IMPORTANT:
+    - Never raises on quota / HTTP errors.
+    - Returns [] and logs, so caller can fall back to DDG.
+    - Every returned item carries `"search_query": query`.
     """
+    if youtube is None:
+        # Should not be called in that case, but be defensive
+        logger.info("YouTube client is None, skipping YouTube search for query='%s'", query)
+        return []
+
     params: Dict[str, Any] = {
         "part": "snippet",
         "q": query,
@@ -209,12 +205,28 @@ def _search_youtube(
         params.get("publishedAfter"),
         params.get("publishedBefore"),
     )
-    print(
-        f"[YouTube] search | query='{query}' | channel={channel_id} | "
-        f"after={params.get('publishedAfter')} | before={params.get('publishedBefore')}"
-    )
 
-    response = youtube.search().list(**params).execute()
+    try:
+        response = youtube.search().list(**params).execute()
+    except HttpError as e:
+        # This is where daily / per-100-seconds quota errors show up
+        logger.warning(
+            "YouTube API HttpError (likely quota) for query='%s'. "
+            "Status=%s, Content=%s. Using DDG fallback instead.",
+            query,
+            getattr(e, "status_code", None),
+            getattr(e, "content", "")[:200],
+        )
+        return []
+    except Exception as e:
+        logger.warning(
+            "YouTube API unexpected error for query='%s'. Error=%s. "
+            "Using DDG fallback instead.",
+            query,
+            e,
+        )
+        return []
+
     items = response.get("items", [])
 
     results: List[Dict[str, Any]] = []
@@ -243,7 +255,6 @@ def _search_youtube(
         )
 
     logger.info("YouTube search returned %d items for query='%s'", len(results), query)
-    print(f"[YouTube] search returned {len(results)} items for '{query}'")
     return results
 
 
@@ -266,8 +277,16 @@ def _search_on_channel_with_queries(
     channel_id: str,
     queries: List[str],
     match_date: Optional[Union[str, datetime]] = None,
-    max_results: int = 10,
+    max_results: int = 5,
+    max_queries: int = 4,
 ) -> List[Dict[str, Any]]:
+    """
+    Search a single channel with a *limited* number of queries to save credits.
+    Quota errors inside will return [] (handled in _search_youtube).
+    """
+    if youtube is None:
+        return []
+
     dt = _safe_parse_date(match_date)
     published_after = published_before = None
     if dt:
@@ -275,7 +294,7 @@ def _search_on_channel_with_queries(
         published_before = dt + timedelta(days=5)
 
     all_items: List[Dict[str, Any]] = []
-    for q in queries:
+    for q in queries[:max_queries]:
         all_items.extend(
             _search_youtube(
                 youtube=youtube,
@@ -294,10 +313,6 @@ def _search_on_channel_with_queries(
         len(deduped),
         len(all_items),
     )
-    print(
-        f"[YouTube] channel {channel_id} produced {len(deduped)} candidates "
-        f"(before dedupe {len(all_items)})"
-    )
     return deduped
 
 
@@ -305,8 +320,16 @@ def _search_globally_with_queries(
     youtube,
     queries: List[str],
     match_date: Optional[Union[str, datetime]] = None,
-    max_results: int = 10,
+    max_results: int = 5,
+    max_queries: int = 4,
 ) -> List[Dict[str, Any]]:
+    """
+    Global YouTube search (no channel filter), with limited queries to save credits.
+    Quota errors inside will return [] (handled in _search_youtube).
+    """
+    if youtube is None:
+        return []
+
     dt = _safe_parse_date(match_date)
     published_after = published_before = None
     if dt:
@@ -314,7 +337,7 @@ def _search_globally_with_queries(
         published_before = dt + timedelta(days=5)
 
     all_items: List[Dict[str, Any]] = []
-    for q in queries:
+    for q in queries[:max_queries]:
         all_items.extend(
             _search_youtube(
                 youtube=youtube,
@@ -332,133 +355,88 @@ def _search_globally_with_queries(
         len(deduped),
         len(all_items),
     )
-    print(
-        f"[YouTube] GLOBAL search produced {len(deduped)} candidates "
-        f"(before dedupe {len(all_items)})"
-    )
     return deduped
 
 
 # ---------------------------------------------------------------------------
-# DDG FALLBACK HELPERS
+# DDG FALLBACK (competition-aware domains)
 # ---------------------------------------------------------------------------
-
-def _extract_video_id_from_url(url: str) -> Optional[str]:
-    """
-    Extract a YouTube video_id from a standard youtube.com or youtu.be URL.
-    """
-    if not url:
-        return None
-
-    # youtu.be/<id>
-    m = re.search(r"youtu\.be/([^?&/]+)", url)
-    if m:
-        return m.group(1)
-
-    # youtube.com/watch?v=<id>
-    m = re.search(r"v=([^?&/]+)", url)
-    if m:
-        return m.group(1)
-
-    return None
-
 
 def _ddg_search_highlights(
     home_team: str,
     away_team: str,
-    match_date: Optional[Union[str, datetime]] = None,
-    competition: Optional[str] = None,
-    brands: Optional[List[str]] = None,
-    max_results: int = 6,
+    competition: Optional[str],
+    domains: List[str],
+    match_date: Optional[Union[str, datetime]],
+    max_results: int = 5,
 ) -> List[Dict[str, Any]]:
     """
-    Credit-free fallback: use DuckDuckGo to find YouTube highlight URLs,
-    biased to specific broadcaster brands and competition.
+    Fallback when YouTube Data API does not give good candidates or is quota-limited.
+
+    Uses DuckDuckGo (ddgs) to search competition-relevant domains
+    and wraps results into the same candidate format used for RAG.
     """
-    if not DDG_AVAILABLE:
-        logger.warning("DDG fallback requested but ddgs is not installed.")
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        logger.warning("[Highlights/DDG] ddgs not installed – skipping DDG fallback.")
         return []
 
     dt = _safe_parse_date(match_date)
-
-    base = f"{home_team} vs {away_team} highlights"
-    queries: List[str] = []
-
-    # 1) competition + brand + date
-    if competition and dt and brands:
-        for b in brands:
-            queries.append(
-                f"{base} {competition} \"{b}\" {dt.strftime('%Y-%m-%d')} site:youtube.com"
-            )
-
-    # 2) competition + brand (no date)
-    if competition and brands:
-        for b in brands:
-            queries.append(f"{base} {competition} \"{b}\" site:youtube.com")
-
-    # 3) competition only
-    if competition:
-        queries.append(f"{base} {competition} site:youtube.com")
-
-    # 4) teams + date
+    date_str = ""
     if dt:
-        queries.append(f"{base} {dt.strftime('%Y-%m-%d')} site:youtube.com")
+        date_str = dt.strftime("%Y-%m-%d")
 
-    # 5) generic
-    queries.append(f"{base} site:youtube.com")
+    comp = (competition or "").strip()
+    base_query = f"{home_team} vs {away_team} highlights"
+    if comp:
+        base_query += f" {comp}"
+    if date_str:
+        base_query += f" {date_str}"
 
-    # dedupe queries
-    seen_q = set()
-    uniq_queries: List[str] = []
-    for q in queries:
-        if q not in seen_q:
-            seen_q.add(q)
-            uniq_queries.append(q)
-
-    print(f"[DDG] highlight queries: {uniq_queries}")
+    logger.info(
+        "[Highlights/DDG] Fallback search for '%s' across domains: %s",
+        base_query,
+        domains,
+    )
 
     results: List[Dict[str, Any]] = []
-    seen_vids = set()
+    seen_urls: set[str] = set()
 
     with DDGS() as ddgs:
-        for q in uniq_queries:
-            print(f"[DDG] searching: {q}")
+        for domain in domains:
+            search_query = f"site:{domain} {base_query}"
+            logger.info("[Highlights/DDG] Query='%s'", search_query)
             try:
-                for r in ddgs.text(q, max_results=max_results):
+                for r in ddgs.text(search_query, max_results=max_results):
                     url = r.get("href") or ""
-                    if "youtube.com" not in url and "youtu.be" not in url:
+                    if not url or url in seen_urls:
                         continue
-
-                    vid = _extract_video_id_from_url(url)
-                    if not vid or vid in seen_vids:
-                        continue
-                    seen_vids.add(vid)
+                    seen_urls.add(url)
 
                     title = r.get("title", "") or ""
                     snippet = r.get("body", "") or ""
-
                     results.append(
                         {
-                            "video_id": vid,
-                            "videoId": vid,
+                            "video_id": None,
+                            "videoId": None,
                             "title": title,
                             "description": snippet,
-                            "channel_title": None,
-                            "channelTitle": None,
-                            "publish_time": None,
-                            "publishTime": None,
+                            "channel_title": domain,
+                            "channelTitle": domain,
+                            "publish_time": "",
+                            "publishTime": "",
                             "url": url,
                             "thumbnails": {},
                             "raw": r,
                             "source_type": "ddg",
-                            "search_query": q,
+                            "search_query": search_query,
                         }
                     )
             except Exception as e:
-                logger.warning("DDG query failed (%s): %s", q, e)
-                print(f"[DDG] query failed for '{q}': {e}")
+                logger.warning("[Highlights/DDG] Error searching domain %s: %s", domain, e)
 
-    print(f"[DDG] total youtube candidates from ddg: {len(results)}")
+    logger.info("[Highlights/DDG] Collected %d DDG candidates", len(results))
     return results
 
 
@@ -486,10 +464,8 @@ def _build_context_text(
         return "\n".join(parts)
 
     if isinstance(match_context, list):
-        # e.g. list of events, dicts, etc.
         return "\n".join(str(x) for x in match_context)
 
-    # Fallback
     return str(match_context)
 
 
@@ -522,7 +498,6 @@ def _candidate_has_teams(
         return h in text and a in text
     if h:
         return h in text
-    # no team info – allow (should be rare in your pipeline)
     return True
 
 
@@ -560,7 +535,6 @@ def _extract_score_from_context(context_text: str) -> Optional[str]:
     matches = re.findall(r"\b\d+[-–:]\d+\b", context_text)
     if not matches:
         return None
-    # Take the first plausible score
     return matches[0].lower()
 
 
@@ -592,9 +566,8 @@ def _validate_with_rag(
     Ranking / validation for highlight candidates.
 
     Heuristics used:
-    - HARD FILTER by team names: if we know the teams, only accept videos whose
-      title or description contain both.
-    - Prefer titles that contain highlight-like words.
+    - HARD FILTER by team names.
+    - Require highlight-like titles (includes "highlights" in practice).
     - Prefer videos whose publish time is close to match_date.
     - Slight boost if title seems to contain the score from match_context.
     - Bonus for preferred channels / official broadcasters.
@@ -602,7 +575,7 @@ def _validate_with_rag(
     if not candidates:
         return []
 
-    # Hard filter by team names first
+    # Filter by team names
     filtered = [
         c for c in candidates
         if _candidate_has_teams(c, home_team, away_team)
@@ -611,9 +584,20 @@ def _validate_with_rag(
     if not filtered:
         logger.warning(
             "No candidates contained both team names. Returning 0 highlights "
-            "(better empty than Mbappé vs random team)."
+            "(better empty than random mismatch)."
         )
-        print("[YouTube] All candidates failed team-name filter → 0 results")
+        return []
+
+    # Require highlight-like titles
+    filtered = [
+        c for c in filtered
+        if _title_matches_context(c.get("title", "") or "", "", home_team, away_team)
+    ]
+
+    if not filtered:
+        logger.warning(
+            "No candidates with highlight-like titles after team filter."
+        )
         return []
 
     candidates = filtered
@@ -623,10 +607,6 @@ def _validate_with_rag(
         "Running RAG-style ranking on %d candidates | context_preview=%s",
         len(candidates),
         context_text[:200],
-    )
-    print(
-        f"[YouTube] RAG-style ranking on {len(candidates)} candidates | "
-        f"context_preview={context_text[:200]!r}"
     )
 
     dt = _safe_parse_date(match_date)
@@ -638,11 +618,10 @@ def _validate_with_rag(
         t = title.lower()
         score = 0.0
 
-        # Strong boost if our simple heuristic says "this looks like true highlights"
-        if _title_matches_context(title, context_text, home_team, away_team):
-            score += 2.0
+        # Already passed highlight-like check; small base bump
+        score += 1.0
 
-        # Score proximity of publish date to match date
+        # Publish date vs match date
         pub_dt = _parse_publish_time(item)
         if dt and pub_dt:
             days_diff = abs((pub_dt.date() - dt.date()).days)
@@ -651,24 +630,23 @@ def _validate_with_rag(
             elif days_diff <= 7:
                 score += 0.75
             else:
-                score -= 0.25  # likely wrong season / old game
+                score -= 0.25
 
-        # Try to match score pattern in title if we extracted one
+        # Score pattern in title
         if score_token:
             t_compact = t.replace(" ", "").replace("–", "-").replace(":", "-")
             s_compact = score_token.replace(" ", "").replace("–", "-").replace(":", "-")
             if s_compact in t_compact:
                 score += 1.2
 
-        # small bonus for preferred-channel hits
+        # Bonus for YouTube channel hits
         if item.get("source_type") == "channel":
             score += 0.5
 
-        # If channel name itself looks like an official club or major broadcaster, small bump
         chan = (item.get("channel_title") or item.get("channelTitle") or "").lower()
         if any(
             kw in chan
-            for kw in ("official", "fc", "cf", "tv", "nbc sports", "espn" )
+            for kw in ("official", "fc", "cf", "tv", "nbc sports", "espn", "cbs", "sky sports")
         ):
             score += 0.5
 
@@ -683,23 +661,16 @@ def _validate_with_rag(
             scored[0][0],
             scored[-1][0],
         )
-        print(
-            f"[YouTube] ranking complete | top_score={scored[0][0]:.2f} "
-            f"| bottom_score={scored[-1][0]:.2f}"
-        )
 
-    # For debugging: log top few (title + query)
     for i, (sc, item) in enumerate(scored[:5]):
         logger.info(
-            "Top-%d candidate | score=%.2f | title=%s | query=%s",
+            "Top-%d candidate | score=%.2f | title=%s | query=%s | url=%s | source_type=%s",
             i + 1,
             sc,
             item.get("title"),
             item.get("search_query"),
-        )
-        print(
-            f"[YouTube] Top-{i+1} | score={sc:.2f} | title={item.get('title')} "
-            f"| query={item.get('search_query')}"
+            item.get("url"),
+            item.get("source_type"),
         )
 
     return ranked[:max_results]
@@ -716,38 +687,32 @@ def search_and_display_highlights_with_metadata(
     match_context: Optional[Union[str, Dict[str, Any], List[Any]]] = None,
     competition: Optional[str] = None,
     max_results: int = 5,
-    web_summary: Optional[str] = None,
-    match_metadata: Optional[Dict[str, Any]] = None,
-    **_: Any,
+    **extra: Any,
 ) -> List[Dict[str, Any]]:
     """
     Main function used by the API layer.
 
-    It will:
-    1. Build search queries from home_team, away_team, match_date (+competition)
-    2. Try competition-specific channels first (limited number of API calls)
-    3. If that fails, use DDG to find YouTube URLs from relevant broadcasters
-    4. If still nothing, fall back to one generic channel, then global YouTube
-    5. Apply RAG-style heuristic to rank and trim results
-    6. Return a list of video metadata dicts
-
-    Each returned dict includes:
-      - "search_query": the query string that produced that result.
+    Behaviour:
+    1. Derive competition-aware channel + domain profile.
+    2. Build search queries.
+    3. If YouTube client available:
+       - Try primary channels (few queries).
+       - If no validated, try secondary channels.
+       - If still nothing, try global YouTube search.
+    4. If YouTube unavailable OR all YouTube phases yield nothing,
+       fall back to DDG with competition-aware domains.
+    5. Apply RAG-style validation.
+    6. Finally, if even DDG fails, return a small raw subset to avoid hard failure.
     """
-    # Infer competition and context if not explicitly provided
-    if competition is None and isinstance(match_metadata, dict):
-        competition = match_metadata.get("competition")
-
-    if match_context is None:
-        # Prefer web_summary as the match context; if not provided, fall back
-        if web_summary is not None:
-            match_context = web_summary
-        elif isinstance(match_metadata, dict):
-            match_context = match_metadata
+    # If competition not explicitly passed, try to pull from match_metadata
+    if competition is None:
+        mm = extra.get("match_metadata")
+        if isinstance(mm, dict):
+            competition = mm.get("competition")
 
     logger.info(
-        "Searching highlights | agent=%s | home_team=%s | away_team=%s | "
-        "match_date=%s | competition=%s | match_context_type=%s",
+        "Searching highlights | agent=%s | home_team=%s | away_team=%s | match_date=%s | "
+        "competition=%s | match_context_type=%s",
         AGENT_VERSION,
         home_team,
         away_team,
@@ -755,110 +720,167 @@ def search_and_display_highlights_with_metadata(
         competition,
         type(match_context).__name__ if match_context is not None else "None",
     )
-    print(
-        f"[YouTube] search_highlights | home={home_team} | away={away_team} | "
-        f"date={match_date} | competition={competition}"
-    )
 
     youtube = _get_youtube_client()
     queries = build_search_queries(home_team, away_team, match_date, competition)
+    profile = _competition_profile(competition)
 
-    # ------------------------------------------------------------------
-    # 1) Competition-specific channels via YouTube API
-    # ------------------------------------------------------------------
-    target_channels = _select_channels_for_competition(competition)
-    candidates: List[Dict[str, Any]] = []
+    primary_channels = profile["primary_channels"]
+    secondary_channels = profile["secondary_channels"]
+    ddg_domains = profile["ddg_domains"]
 
-    if target_channels:
-        for channel_id in target_channels:
-            print(f"[YouTube] Trying competition channel: {channel_id}")
-            items = _search_on_channel_with_queries(
-                youtube=youtube,
-                channel_id=channel_id,
-                queries=queries,
-                match_date=match_date,
-                max_results=max_results * 2,  # grab a few extra for ranking
-            )
-            candidates.extend(items)
-
-    candidates = _dedupe_by_video_id(candidates)
-
-    # ------------------------------------------------------------------
-    # 2) DDG fallback tied to same competition / brands (no YouTube credits)
-    # ------------------------------------------------------------------
-    if not candidates:
-        ddg_brands = _select_brands_for_competition(competition)
-        if ddg_brands:
-            print(f"[DDG] Using competition brands {ddg_brands} as fallback")
+    # If YouTube completely unavailable (no key / init failed), jump straight to DDG
+    if youtube is None:
+        logger.info("YouTube unavailable; using DDG-only fallback for highlights.")
         ddg_candidates = _ddg_search_highlights(
             home_team=home_team,
             away_team=away_team,
-            match_date=match_date,
             competition=competition,
-            brands=ddg_brands,
+            domains=ddg_domains,
+            match_date=match_date,
             max_results=max_results * 2,
         )
-        candidates.extend(ddg_candidates)
-
-    candidates = _dedupe_by_video_id(candidates)
+        if ddg_candidates:
+            validated = _validate_with_rag(
+                candidates=ddg_candidates,
+                match_context=match_context,
+                home_team=home_team,
+                away_team=away_team,
+                match_date=match_date,
+                max_results=max_results,
+            )
+            if validated:
+                logger.info(
+                    "Returning validated highlights from DDG-only fallback (%d videos)",
+                    len(validated),
+                )
+                return validated
+        return ddg_candidates[:max_results]
 
     # ------------------------------------------------------------------
-    # 3) If still nothing, try ONE fallback channel, then GLOBAL YouTube
+    # 1) Primary competition-aware channels
     # ------------------------------------------------------------------
-    if not candidates and not target_channels and PREFERRED_CHANNEL_IDS:
-        fallback_channel = PREFERRED_CHANNEL_IDS[0]
-        print(f"[YouTube] No competition mapping; trying fallback channel {fallback_channel}")
+    candidates: List[Dict[str, Any]] = []
+    for channel_id in primary_channels:
+        logger.info("Trying primary channel: %s", channel_id)
         items = _search_on_channel_with_queries(
             youtube=youtube,
-            channel_id=fallback_channel,
+            channel_id=channel_id,
             queries=queries,
             match_date=match_date,
             max_results=max_results * 2,
+            max_queries=4,
         )
         candidates.extend(items)
 
-    candidates = _dedupe_by_video_id(candidates)
+    validated = _validate_with_rag(
+        candidates=candidates,
+        match_context=match_context,
+        home_team=home_team,
+        away_team=away_team,
+        match_date=match_date,
+        max_results=max_results,
+    )
+    if validated:
+        logger.info(
+            "Returning validated highlights from primary channels (%d videos)",
+            len(validated),
+        )
+        return validated
 
-    if not candidates:
-        print("[YouTube] No channel/DDG hits; falling back to GLOBAL search")
-        candidates = _search_globally_with_queries(
+    # ------------------------------------------------------------------
+    # 2) Secondary channels
+    # ------------------------------------------------------------------
+    secondary_candidates: List[Dict[str, Any]] = []
+    for channel_id in secondary_channels:
+        logger.info("Trying secondary channel: %s", channel_id)
+        items = _search_on_channel_with_queries(
             youtube=youtube,
+            channel_id=channel_id,
             queries=queries,
             match_date=match_date,
             max_results=max_results * 2,
+            max_queries=3,
         )
+        secondary_candidates.extend(items)
 
-    # 4) Apply RAG-style validation / ranking
-    try:
+    validated = _validate_with_rag(
+        candidates=secondary_candidates,
+        match_context=match_context,
+        home_team=home_team,
+        away_team=away_team,
+        match_date=match_date,
+        max_results=max_results,
+    )
+    if validated:
+        logger.info(
+            "Returning validated highlights from secondary channels (%d videos)",
+            len(validated),
+        )
+        return validated
+
+    # ------------------------------------------------------------------
+    # 3) Global YouTube search
+    # ------------------------------------------------------------------
+    logger.info("No good channel hits; falling back to global YouTube search.")
+    global_candidates = _search_globally_with_queries(
+        youtube=youtube,
+        queries=queries,
+        match_date=match_date,
+        max_results=max_results * 2,
+        max_queries=4,
+    )
+
+    validated = _validate_with_rag(
+        candidates=global_candidates,
+        match_context=match_context,
+        home_team=home_team,
+        away_team=away_team,
+        match_date=match_date,
+        max_results=max_results,
+    )
+    if validated:
+        logger.info(
+            "Returning validated highlights from global YouTube search (%d videos)",
+            len(validated),
+        )
+        return validated
+
+    # ------------------------------------------------------------------
+    # 4) DDG fallback – competition-aware domains
+    # ------------------------------------------------------------------
+    logger.info("No validated YouTube highlights – trying DDG fallback.")
+    ddg_candidates = _ddg_search_highlights(
+        home_team=home_team,
+        away_team=away_team,
+        competition=competition,
+        domains=ddg_domains,
+        match_date=match_date,
+        max_results=max_results * 2,
+    )
+
+    if ddg_candidates:
         validated = _validate_with_rag(
-            candidates=candidates,
+            candidates=ddg_candidates,
             match_context=match_context,
             home_team=home_team,
             away_team=away_team,
             match_date=match_date,
             max_results=max_results,
         )
-    except Exception as e:
-        # This ensures we NEVER bubble up things like "'list' object has no attribute 'split'"
-        logger.exception("RAG validation failed (agent=%s): %s", AGENT_VERSION, e)
-        print(f"[YouTube] RAG validation failed: {e} – returning unranked candidates")
-        validated = candidates[:max_results]
+        if validated:
+            logger.info(
+                "Returning validated highlights from DDG fallback (%d videos)",
+                len(validated),
+            )
+            return validated
 
-    logger.info("Final validated highlight count: %d", len(validated))
-    print(f"[YouTube] Final validated highlight count: {len(validated)}")
-
-    # Optional: log the queries of the final picks clearly
-    for i, v in enumerate(validated, start=1):
-        logger.info(
-            "Final video %d | title=%s | query=%s | url=%s",
-            i,
-            v.get("title"),
-            v.get("search_query"),
-            v.get("url"),
-        )
-        print(
-            f"[YouTube] Final video {i} | title={v.get('title')} | "
-            f"query={v.get('search_query')} | url={v.get('url')}"
-        )
-
-    return validated
+    # ------------------------------------------------------------------
+    # 5) Absolute fallback – return raw few results to avoid total failure
+    # ------------------------------------------------------------------
+    logger.warning(
+        "No validated highlights from YouTube or DDG. Returning up to %d raw candidates.",
+        max_results,
+    )
+    all_raw = candidates + secondary_candidates + global_candidates + ddg_candidates
+    return all_raw[:max_results]

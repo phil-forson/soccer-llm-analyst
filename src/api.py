@@ -46,6 +46,43 @@ def _get_thinking_llm_client() -> OpenAI:
 
 
 # =============================================================================
+# OpenAI quota / credits handling
+# =============================================================================
+
+def _is_openai_quota_error(exc: Exception) -> bool:
+    """
+    Heuristic detection for OpenAI 'credits/quota exhausted' errors.
+
+    We keep it simple and just inspect the message text so this works
+    across different client versions and error shapes.
+    """
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in [
+            "insufficient_quota",
+            "you exceeded your current quota",
+            "exceeded your current quota",
+            "billing hard limit",
+            "hard limit has been reached",
+            "insufficient funds",
+        ]
+    )
+
+
+def _quota_exceeded_summary() -> str:
+    """
+    User-facing message when our OpenAI credits are out.
+    """
+    return (
+        "⚠️ Our AI match analyst is temporarily unavailable because we've hit our "
+        "OpenAI usage limit.\n\n"
+        "Please try again a bit later. If this keeps happening, the site owner "
+        "may need to top up their OpenAI credits."
+    )
+
+
+# =============================================================================
 # Logging Setup
 # =============================================================================
 
@@ -637,8 +674,41 @@ async def _process_query_with_thinking(request: QueryRequest):
             except:
                 pass
         except Exception as e:
+            # OpenAI quota / credits exhausted
+            if _is_openai_quota_error(e):
+                msg = _quota_exceeded_summary()
+                yield _send_thinking(
+                    "error",
+                    msg,
+                    "error",
+                    {"error": "openai_quota_exceeded"}
+                )
+                error_response = {
+                    "success": False,
+                    "intent": intent,
+                    "summary": msg,
+                    "error": "openai_quota_exceeded",
+                    "match_metadata": None,
+                    "highlights": [],
+                    "sources": [],
+                    "game_analysis": None,
+                }
+                yield f"data: {json.dumps({'type': 'result', 'data': error_response})}\n\n"
+                return
+
+            # Generic error path
             yield _send_thinking("web_search", f"Web search error: {str(e)}", "error")
-            yield f"data: {json.dumps({'type': 'result', 'data': {'success': False, 'intent': intent, 'summary': f'Error searching the web: {str(e)}', 'error': str(e)}})}\n\n"
+            generic_response = {
+                "success": False,
+                "intent": intent,
+                "summary": f"Error searching the web: {str(e)}",
+                "error": str(e),
+                "match_metadata": None,
+                "highlights": [],
+                "sources": [],
+                "game_analysis": None,
+            }
+            yield f"data: {json.dumps({'type': 'result', 'data': generic_response})}\n\n"
             return
         
         # Extract sources from summary
@@ -1001,11 +1071,28 @@ async def query_endpoint(request: QueryRequest):
             )
             web_summary = result
         except Exception as e:
+            # Special handling for OpenAI quota / credits exhausted
+            if _is_openai_quota_error(e):
+                return QueryResponse(
+                    success=False,
+                    intent=intent,
+                    summary=_quota_exceeded_summary(),
+                    error="openai_quota_exceeded",
+                    match_metadata=None,
+                    highlights=[],
+                    sources=[],
+                    game_analysis=None,
+                )
+
             return QueryResponse(
                 success=False,
                 intent=intent,
                 summary=f"Error searching the web: {str(e)}",
-                error=str(e)
+                error=str(e),
+                match_metadata=None,
+                highlights=[],
+                sources=[],
+                game_analysis=None,
             )
         
         # Extract sources from summary
@@ -1107,6 +1194,19 @@ async def query_endpoint(request: QueryRequest):
         )
         
     except Exception as e:
+        # Top-level catch-all
+        if _is_openai_quota_error(e):
+            return QueryResponse(
+                success=False,
+                intent="general",
+                summary=_quota_exceeded_summary(),
+                error="openai_quota_exceeded",
+                match_metadata=None,
+                highlights=[],
+                sources=[],
+                game_analysis=None,
+            )
+
         return QueryResponse(
             success=False,
             intent="general",
@@ -1181,6 +1281,11 @@ async def analyze_match_endpoint(request: QueryRequest):
                 parsed_query=parsed
             )
         except Exception as e:
+            if _is_openai_quota_error(e):
+                return GameAnalysisResponse(
+                    success=False,
+                    error=_quota_exceeded_summary()
+                )
             return GameAnalysisResponse(
                 success=False,
                 error=f"Web search failed: {str(e)}"
@@ -1252,6 +1357,11 @@ async def analyze_match_endpoint(request: QueryRequest):
         )
         
     except Exception as e:
+        if _is_openai_quota_error(e):
+            return GameAnalysisResponse(
+                success=False,
+                error=_quota_exceeded_summary()
+            )
         return GameAnalysisResponse(
             success=False,
             error=f"An error occurred: {str(e)}"
