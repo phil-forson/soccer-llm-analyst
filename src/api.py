@@ -86,31 +86,17 @@ def _quota_exceeded_summary() -> str:
 # Logging Setup
 # =============================================================================
 
-# Configure logging for thinking messages
+# Just log to stdout/stderr (Render captures this automatically)
 thinking_logger = logging.getLogger("thinking")
 thinking_logger.setLevel(logging.INFO)
 
-# Create file handler for thinking logs
-thinking_handler = logging.FileHandler('thinking.log', mode='a', encoding='utf-8')
-thinking_handler.setLevel(logging.INFO)
-
-# Create formatter
-thinking_formatter = logging.Formatter(
-    '%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-thinking_handler.setFormatter(thinking_formatter)
-
-# Add handler to logger
-if not thinking_logger.handlers:
-    thinking_logger.addHandler(thinking_handler)
-
 def _log_thinking(stage: str, message: str, status: str, data: Optional[Dict] = None):
-    """Log thinking messages to file."""
+    """Log thinking messages (no file handler, just normal logging)."""
     log_msg = f"[{stage.upper()}] [{status.upper()}] {message}"
     if data:
         log_msg += f" | Data: {json.dumps(data, default=str)}"
     thinking_logger.info(log_msg)
+
 
 
 # =============================================================================
