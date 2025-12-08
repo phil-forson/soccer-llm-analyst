@@ -1,1711 +1,623 @@
 """
-Web search agent for finding football match information.
+Web search + RAG agent for finding football match information.
 
-Uses DuckDuckGo for web search (free, no API key required).
-Implements RAG: chunks results, embeds, retrieves relevant context.
-STRICT: Will NOT hallucinate - only reports what it actually finds.
+- Uses DuckDuckGo (ddgs) for web search.
+- Optional embeddings-based RAG via Chroma.
+- Extracts match metadata deterministically (no JSON-from-LLM parsing).
 """
 
-import re
+from __future__ import annotations
+
 import hashlib
-from datetime import datetime
-from typing import Optional
+import re
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List, Dict, Any
 
 from openai import OpenAI
 
 from .config import get_openai_key, DEFAULT_LLM_MODEL
 
-# Try to import RAG components (optional)
+# -----------------------------------------------------------------------------
+# Optional RAG support
+# -----------------------------------------------------------------------------
 RAG_AVAILABLE = False
 try:
     from .embeddings_store import _get_embedding_model, _get_collection
     RAG_AVAILABLE = True
 except ImportError:
-    print("[RAG] Note: embeddings_store not available, using simple search")
+    print("[RAG] Note: embeddings_store not available, using simple context only")
 
+# -----------------------------------------------------------------------------
+# Search configuration
+# -----------------------------------------------------------------------------
+MAX_RESULTS = 10
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
-MAX_RESULTS = 5
-MAX_SEARCH_RESULTS = 15  # Fetch more, then filter to best
-
-# Trusted football sources (prioritized in relevance scoring)
 TRUSTED_SOURCES = [
-    # Tier 1 - Highly authoritative match data
     "espn.com",
     "bbc.com/sport",
     "bbc.co.uk/sport",
     "skysports.com",
     "goal.com",
-    "transfermarkt",
     "flashscore.com",
     "sofascore.com",
     "whoscored.com",
     "fotmob.com",
-    # Tier 2 - Major sports news
-    "theguardian.com/football",
-    "telegraph.co.uk/football",
-    "90min.com",
-    "football365.com",
-    "givemesport.com",
-    "sportskeeda.com",
-    "marca.com",
-    "as.com",
-    # Tier 3 - Club/League official sources
     "premierleague.com",
-    "laliga.com",
-    "bundesliga.com",
-    "seriea.com",
-    "ligue1.com",
-    "uefa.com",
-    "fifa.com",
-]
-
-# Trusted blog/news domains to probe when primary search yields nothing
-BLOG_SOURCES = [
-    "nbcsports.com",
-    "espn.com",
-    "bbc.com",
-    "skysports.com",
     "theguardian.com/football",
-    "premierleague.com",
 ]
 
-# Keywords that indicate match-relevant content
-RELEVANCE_KEYWORDS = [
-    "score", "result", "goals", "match report", "highlights",
-    "vs", "v.", "versus", "final score", "full time", "ft",
-    "win", "draw", "loss", "defeat", "victory",
-    "lineup", "starting xi", "team news",
-    "premier league", "champions league", "la liga", "serie a",
-    "bundesliga", "europa league", "fa cup", "carabao cup",
-]
-
-# Keywords that indicate low-relevance content (filter out)
-LOW_RELEVANCE_KEYWORDS = [
-    "betting", "odds", "prediction", "preview", "upcoming",
-    "tickets", "buy tickets", "merchandise", "shop",
-    "fantasy", "fpl", "dream team",
-]
-
-
-# =============================================================================
-# LLM Client
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# OpenAI client singleton
+# -----------------------------------------------------------------------------
 _openai_client: Optional[OpenAI] = None
 
 
 def _get_openai_client() -> OpenAI:
-    """Get or initialize the OpenAI client."""
     global _openai_client
     if _openai_client is None:
         _openai_client = OpenAI(api_key=get_openai_key())
     return _openai_client
 
 
-# =============================================================================
-# LLM-Based Natural Language Query Parser
-# =============================================================================
-
-def _parse_query_with_llm(query: str) -> dict:
-    """
-    Use LLM to parse natural language queries into structured match info.
-    
-    Handles queries like:
-        - "tell me about the most recent man city game"
-        - "arsenal vs chelsea last week"
-        - "what happened in the liverpool match yesterday"
-        - "man united champions league result"
-    
-    Args:
-        query: Natural language query from user.
-        
-    Returns:
-        dict with parsed match information.
-    """
-    print(f"\n[QueryParser] === Parsing Natural Language Query ===")
-    print(f"[QueryParser] Input: \"{query}\"")
-    
-    try:
-        client = _get_openai_client()
-        
-        # Get current date for context
-        today = datetime.now()
-        current_date = today.strftime("%Y-%m-%d")
-        current_month = today.strftime("%B %Y")
-        
-        system_prompt = """You are a football/soccer query parser. Extract match information from natural language queries.
-
-IMPORTANT: Normalize team nicknames to full official names:
-- "man city", "city" → "Manchester City"
-- "man utd", "united" → "Manchester United"  
-- "spurs" → "Tottenham"
-- "arsenal", "gunners" → "Arsenal"
-- "liverpool", "reds" (in PL context) → "Liverpool"
-- "chelsea", "blues" (in PL context) → "Chelsea"
-- "barca" → "Barcelona"
-- "real", "madrid" → "Real Madrid"
-- "bayern" → "Bayern Munich"
-- etc.
-
-Extract and return ONLY valid JSON with these fields:
-{
-    "home_team": "full team name or null",
-    "away_team": "full team name or null",
-    "date": "YYYY-MM-DD or null",
-    "date_context": "most recent/last week/yesterday/specific description or null",
-    "competition": "Premier League/Champions League/etc or null",
-    "is_most_recent": true/false
-}
-
-If user says "most recent", "latest", "last game" - set is_most_recent to true.
-If user mentions a specific date, convert to YYYY-MM-DD format.
-If only one team mentioned, put it in home_team, leave away_team null."""
-
-        user_prompt = f"""Parse this football query. Today's date is {current_date} ({current_month}).
-
-Query: "{query}"
-
-Return ONLY the JSON object, no other text."""
-
-        response = client.chat.completions.create(
-            model=DEFAULT_LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0,
-            max_tokens=200,
-        )
-        
-        answer = response.choices[0].message.content.strip()
-        
-        # Parse the JSON response
-        import json
-        
-        # Clean up the response (remove markdown code blocks if present)
-        if answer.startswith("```"):
-            answer = answer.split("```")[1]
-            if answer.startswith("json"):
-                answer = answer[4:]
-        answer = answer.strip()
-        
-        parsed = json.loads(answer)
-        
-        print(f"[QueryParser] LLM parsed result:")
-        print(f"[QueryParser]   Home team: {parsed.get('home_team', 'None')}")
-        print(f"[QueryParser]   Away team: {parsed.get('away_team', 'None')}")
-        print(f"[QueryParser]   Date: {parsed.get('date', 'None')}")
-        print(f"[QueryParser]   Date context: {parsed.get('date_context', 'None')}")
-        print(f"[QueryParser]   Competition: {parsed.get('competition', 'None')}")
-        print(f"[QueryParser]   Most recent: {parsed.get('is_most_recent', False)}")
-        
-        return parsed
-        
-    except Exception as e:
-        print(f"[QueryParser] LLM parsing failed: {e}")
-        print(f"[QueryParser] Falling back to regex parsing")
-        return {}
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+def _safe_lower(value: Any) -> str:
+    return str(value).lower() if value is not None else ""
 
 
-# =============================================================================
-# Query Parsing (for logging)
-# =============================================================================
-
-def _parse_search_query(query: str) -> dict:
-    """
-    Parse a match query using LLM for natural language understanding.
-    
-    Handles queries like:
-        - "tell me about the most recent man city game"
-        - "arsenal vs chelsea result"
-        - "what happened in the liverpool match"
-    
-    Args:
-        query: User's search query (natural language).
-        
-    Returns:
-        dict with home_team, away_team, date, year, competition, is_most_recent.
-    """
-    # First, try LLM parsing for natural language understanding
-    llm_result = _parse_query_with_llm(query)
-    
-    result = {
-        "home_team": None,
-        "away_team": None,
-        "date": None,
-        "year": None,
-        "competition": None,
-        "is_most_recent": False,
-    }
-    
-    # Use LLM results if available
-    if llm_result:
-        result["home_team"] = llm_result.get("home_team")
-        result["away_team"] = llm_result.get("away_team")
-        result["date"] = llm_result.get("date")
-        result["competition"] = llm_result.get("competition")
-        result["is_most_recent"] = llm_result.get("is_most_recent", False)
-        
-        # Extract year from date if present
-        if result["date"]:
-            result["year"] = result["date"][:4]
-    
-    # If LLM didn't find teams, fall back to regex parsing
-    if not result["home_team"]:
-        print(f"[WebSearch] LLM didn't extract teams, using regex fallback...")
-        result = _parse_search_query_regex(query, result)
-    
-    return result
-
-
-def _parse_search_query_regex(query: str, result: dict) -> dict:
-    """
-    Regex-based fallback parser for search queries.
-    
-    Args:
-        query: Original query string.
-        result: Existing result dict to update.
-        
-    Returns:
-        Updated result dict.
-    """
-    working_query = query
-    
-    # Extract competition names first
-    competition_patterns = [
-        r"(champions\s*league)",
-        r"(europa\s*league)",
-        r"(premier\s*league)",
-        r"(la\s*liga)",
-        r"(serie\s*a)",
-        r"(bundesliga)",
-        r"(ligue\s*1)",
-        r"(fa\s*cup)",
-        r"(carabao\s*cup)",
-        r"(efl\s*cup)",
-        r"(world\s*cup)",
-        r"(euro\s*\d{4})",
-        r"(copa\s*america)",
-    ]
-    
-    if not result.get("competition"):
-        for pattern in competition_patterns:
-            comp_match = re.search(pattern, working_query, re.IGNORECASE)
-            if comp_match:
-                result["competition"] = comp_match.group(1)
-                working_query = working_query.replace(comp_match.group(1), "")
-                break
-    
-    # Extract date (YYYY-MM-DD)
-    if not result.get("date"):
-        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", working_query)
-        if date_match:
-            result["date"] = date_match.group(1)
-            result["year"] = date_match.group(1)[:4]
-            working_query = working_query.replace(date_match.group(1), "")
-    
-    # Extract year
-    if not result.get("year"):
-        year_match = re.search(r"\b(20\d{2})\b", working_query)
-        if year_match:
-            result["year"] = year_match.group(1)
-            working_query = working_query.replace(year_match.group(1), "")
-    
-    # Parse teams
-    if not result.get("home_team"):
-        separators = r"\s+(?:vs\.?|v\.?|versus|-|against|@)\s+"
-        parts = re.split(separators, working_query.strip(), flags=re.IGNORECASE)
-        
-        if len(parts) >= 2:
-            result["home_team"] = parts[0].strip()
-            result["away_team"] = parts[1].strip()
-        elif len(parts) == 1 and parts[0].strip():
-            result["home_team"] = parts[0].strip()
-    
-    return result
-
-
-# =============================================================================
-# Relevance Scoring
-# =============================================================================
-
-def _calculate_relevance_score(result: dict, parsed: dict) -> float:
-    """
-    Calculate relevance score for a search result.
-    
-    Higher score = more relevant.
-    
-    Args:
-        result: Search result dict.
-        parsed: Parsed query info.
-        
-    Returns:
-        Relevance score (0.0 to 100.0).
-    """
-    score = 0.0
-    
-    title = result.get("title", "").lower()
-    snippet = result.get("snippet", "").lower()
-    url = result.get("url", "").lower()
-    combined = f"{title} {snippet} {url}"
-    
-    home = (parsed.get("home_team") or "").lower()
-    away = (parsed.get("away_team") or "").lower()
-    date = parsed.get("date", "")
-    year = parsed.get("year", "")
-    competition = (parsed.get("competition") or "").lower()
-    is_most_recent = parsed.get("is_most_recent", False)
-    current_year = datetime.now().year
-    
-    # ========== TEAM MATCHING (up to 40 points) ==========
-    if home:
-        # Check for team name in title (most important)
-        if home in title:
-            score += 15
-        elif home in snippet:
-            score += 8
-    
-    if away:
-        if away in title:
-            score += 15
-        elif away in snippet:
-            score += 8
-    
-    # Bonus for both teams in title (strong match signal)
-    if home and away and home in title and away in title:
-        score += 10
-    
-    # ========== DATE/YEAR MATCHING (up to 15 points) ==========
-    if date and date in combined:
-        score += 15
-    elif year and year in combined:
-        score += 8
-    
-    # ========== COMPETITION MATCHING (up to 10 points) ==========
-    if competition and competition in combined:
-        score += 10
-    
-    # ========== SOURCE TRUST SCORE (up to 20 points) ==========
-    for i, source in enumerate(TRUSTED_SOURCES):
-        if source in url:
-            # Higher score for sources at the top of the list
-            trust_score = 20 - min(i, 15)  # 20 to 5 points
-            score += trust_score
-            break
-    
-    # ========== RELEVANCE KEYWORD BONUS (up to 15 points) ==========
-    keyword_matches = 0
-    for keyword in RELEVANCE_KEYWORDS:
-        if keyword in combined:
-            keyword_matches += 1
-    score += min(keyword_matches * 2, 15)
-
-    # ========== RECENCY BIAS WHEN NO DATE BUT MOST RECENT (up to 8 points) ==========
-    if is_most_recent and not date:
-        # Prefer pages that mention the current season year
-        if str(current_year) in combined:
-            score += 5
-        elif str(current_year - 1) in combined:
-            score += 3
-    
-    # ========== LOW RELEVANCE PENALTY (subtract up to 30 points) ==========
-    for keyword in LOW_RELEVANCE_KEYWORDS:
-        if keyword in combined:
-            score -= 10
-    
-    # Clamp score to valid range
-    return max(0.0, min(100.0, score))
-
-
-def _filter_and_rank_results(results: list[dict], parsed: dict) -> list[dict]:
-    """
-    Filter and rank search results by relevance.
-    
-    Args:
-        results: Raw search results.
-        parsed: Parsed query info.
-        
-    Returns:
-        Filtered and ranked results.
-    """
-    if not results:
-        return []
-    
-    # Strict guards for accuracy: require teams (and date when present)
-    def _contains(team: str, text: str) -> bool:
-        return bool(team and team in text)
-    
-    def _passes_team_guard(res: dict) -> bool:
-        title = res.get("title", "").lower()
-        snippet = res.get("snippet", "").lower()
-        home = (parsed.get("home_team") or "").lower()
-        away = (parsed.get("away_team") or "").lower()
-        if home and away:
-            return (_contains(home, title) or _contains(home, snippet)) and (_contains(away, title) or _contains(away, snippet))
-        if home:
-            return _contains(home, title) or _contains(home, snippet)
-        return True
-    
-    def _passes_date_guard(res: dict) -> bool:
-        date = parsed.get("date", "")
-        if not date:
-            return True
-        combined = f"{res.get('title', '')} {res.get('snippet', '')} {res.get('url', '')}".lower()
-        return date.lower() in combined
-    
-    guarded_results = []
-    for res in results:
-        if not _passes_team_guard(res):
-            print(f"[WebSearch][Guard] Dropped (missing teams): {res.get('title', '')[:80]}")
-            continue
-        if not _passes_date_guard(res):
-            print(f"[WebSearch][Guard] Dropped (missing date match): {res.get('title', '')[:80]}")
-            continue
-        guarded_results.append(res)
-    
-    if not guarded_results:
-        print("[WebSearch][Guard] All results filtered out by strict guards")
-        return []
-
-    # Score all results
-    scored = []
-    for result in guarded_results:
-        score = _calculate_relevance_score(result, parsed)
-        result["_relevance_score"] = score
-        scored.append((score, result))
-    
-    # Sort by score (highest first)
-    scored.sort(key=lambda x: x[0], reverse=True)
-    
-    # Filter out very low scoring results (likely irrelevant)
-    MIN_SCORE_THRESHOLD = 10.0
-    filtered = [r for (score, r) in scored if score >= MIN_SCORE_THRESHOLD]
-    
-    # Log scoring for debugging
-    print(f"[WebSearch] Relevance scoring:")
-    for score, result in scored[:8]:
-        url_short = result.get("url", "")[:50]
-        status = "✓" if score >= MIN_SCORE_THRESHOLD else "✗"
-        print(f"  {status} Score {score:.1f}: {url_short}...")
-    
-    return filtered
-
-
-# =============================================================================
-# Web Search with DDG Library
-# =============================================================================
-
-def _search_ddg(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
-    """
-    Search using DuckDuckGo ddgs library.
-    
-    Args:
-        query: Search query.
-        max_results: Maximum results.
-        
-    Returns:
-        List of search results.
-    """
+def _search_with_source(query: str,
+                        source: Optional[str] = None,
+                        max_results: int = 10) -> List[Dict[str, str]]:
+    """Search ddgs with optional site restriction."""
     try:
         from ddgs import DDGS
-        
-        print(f"[WebSearch] DDG query: \"{query}\"")
-        
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                result = {
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", ""),
-                    "url": r.get("href", ""),
-                    "source": "DuckDuckGo",
-                }
-                results.append(result)
-                print(f"[WebSearch]   Found: {result['title'][:60]}...")
-        
-        print(f"[WebSearch] Total results: {len(results)}")
-        return results
-        
     except ImportError:
         print("[WebSearch] ERROR: ddgs library not installed")
         return []
-    except Exception as e:
-        print(f"[WebSearch] ERROR: {e}")
-        return []
 
+    results: List[Dict[str, str]] = []
+    search_query = f"site:{source} {query}" if source else query
 
-def _build_search_queries(parsed: dict, query: str) -> list[str]:
-    """
-    Build a list of highly targeted search queries.
-    
-    Handles both specific match queries and "most recent" style queries.
-    
-    Args:
-        parsed: Parsed query info.
-        query: Original query string.
-        
-    Returns:
-        List of search queries (most specific first).
-    """
-    search_queries = []
-    
-    home = parsed.get("home_team", "")
-    away = parsed.get("away_team", "")
-    date = parsed.get("date", "")
-    year = parsed.get("year", "")
-    competition = parsed.get("competition", "")
-    is_most_recent = parsed.get("is_most_recent", False)
-    
-    current_year = datetime.now().year
-    current_month = datetime.now().strftime("%B")
-    
-    # ========== MOST RECENT MATCH QUERIES ==========
-    if is_most_recent and home:
-        # User wants the most recent match for a team
-        search_queries.append(f"{home} latest match result score {current_month} {current_year}")
-        search_queries.append(f"{home} most recent game result {current_year}")
-        search_queries.append(f"site:espn.com {home} latest result {current_year}")
-        search_queries.append(f"site:bbc.com/sport {home} latest match")
-        search_queries.append(f"{home} last match score {current_month}")
-        search_queries.append(f"{home} recent results {current_year}")
-        
-        if competition:
-            search_queries.append(f"{home} {competition} latest result {current_year}")
-        
-        if away:
-            search_queries.append(f"{home} vs {away} latest match {current_year}")
-    
-    # ========== SPECIFIC MATCH QUERIES ==========
-    elif home and away:
-        match_str = f"{home} vs {away}"
-        
-        # If no date specified, prioritize most recent match searches
-        if not date and not is_most_recent:
-            # Default to most recent if no date given
-            is_most_recent = True
-        
-        # TIER 1: Most specific (date + teams)
-        if date:
-            search_queries.append(f"site:espn.com {match_str} {date}")
-            search_queries.append(f"site:bbc.com {match_str} {date}")
-            search_queries.append(f"{match_str} {date} score result final")
-            search_queries.append(f"{match_str} {date} match report")
-        elif is_most_recent:
-            # Most recent match queries (prioritize these when no date)
-            search_queries.append(f"{home} vs {away} latest match result {current_year}")
-            search_queries.append(f"{home} vs {away} most recent game {current_month} {current_year}")
-            search_queries.append(f"site:espn.com {home} {away} latest result")
-            search_queries.append(f"site:bbc.com/sport {home} {away} latest match")
-            search_queries.append(f"{home} {away} last match score {current_year}")
-        
-        # TIER 2: Year + teams
-        if year:
-            search_queries.append(f"site:espn.com {match_str} {year}")
-            search_queries.append(f"{match_str} {year} score result")
-            search_queries.append(f"{match_str} {year} match report highlights")
-            
-            if competition:
-                search_queries.append(f"{match_str} {competition} {year}")
-        
-        # TIER 3: General match searches (only if not most recent)
-        if not is_most_recent:
-            search_queries.append(f"{match_str} final score goals")
-            search_queries.append(f"{match_str} match result score {current_year}")
-            search_queries.append(f"{match_str} full time result")
-        
-        # Site-specific
-        search_queries.append(f"site:skysports.com {match_str}")
-        search_queries.append(f"site:goal.com {match_str}")
-        search_queries.append(f"site:flashscore.com {home} {away}")
-        search_queries.append(f"site:sofascore.com {home} {away}")
-    
-    # ========== SINGLE TEAM QUERIES ==========
-    elif home:
-        if date:
-            search_queries.append(f"{home} match {date} score result")
-        if year:
-            search_queries.append(f"{home} matches {year} results")
-        
-        # Recent matches for single team
-        search_queries.append(f"{home} latest match result score {current_year}")
-        search_queries.append(f"{home} recent results {current_month} {current_year}")
-        search_queries.append(f"site:espn.com {home} results {current_year}")
-        
-    else:
-        # Fallback: use original query with enhancements
-        search_queries.append(f"{query} score result")
-        search_queries.append(f"{query} match report")
-    
-    return search_queries
-
-
-def web_search(query: str) -> list[dict]:
-    """
-    Perform a web search for match information.
-    
-    Uses multiple targeted queries and relevance scoring to find
-    the most relevant sources.
-    
-    Args:
-        query: Search query.
-        
-    Returns:
-        List of highly relevant search results.
-    """
-    # Parse the query
-    parsed = _parse_search_query(query)
-    
-    print(f"\n[WebSearch] === Starting Web Search ===")
-    print(f"[WebSearch] Original query: \"{query}\"")
-    print(f"[WebSearch] Parsed home team: {parsed.get('home_team', 'Unknown')}")
-    print(f"[WebSearch] Parsed away team: {parsed.get('away_team', 'Unknown')}")
-    print(f"[WebSearch] Parsed date: {parsed.get('date', 'Not specified')}")
-    print(f"[WebSearch] Parsed competition: {parsed.get('competition', 'Not specified')}")
-    print(f"[WebSearch] Most recent: {parsed.get('is_most_recent', False)}")
-
-    # If no date is provided, force most-recent search emphasis
-    if not parsed.get("date") and not parsed.get("is_most_recent"):
-        parsed["is_most_recent"] = True
-        print("[WebSearch] No date provided; defaulting to MOST RECENT match searches")
-    
-    # Build targeted search queries
-    search_queries = _build_search_queries(parsed, query)
-    
-    print(f"[WebSearch] Generated {len(search_queries)} targeted queries")
-    
-    # Execute searches and collect results
-    all_results = []
-    seen_urls = set()
-    
-    # Run multiple queries to gather a pool of results
-    queries_to_run = search_queries[:6]  # Limit to avoid rate limiting
-    
-    for sq in queries_to_run:
-        results = _search_ddg(sq, max_results=5)
-        
-        for r in results:
-            url = r.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                all_results.append(r)
-        
-        # If we have a good pool, we can stop
-        if len(all_results) >= MAX_SEARCH_RESULTS:
-            break
-    
-    print(f"[WebSearch] Collected {len(all_results)} raw results")
-    
-    # ========== RELEVANCE FILTERING ==========
-    # Score and rank results by relevance
-    ranked_results = _filter_and_rank_results(all_results, parsed)
-    
-    print(f"[WebSearch] After relevance filtering: {len(ranked_results)} results")
-    print(f"[WebSearch] === Search Complete ===\n")
-    
-    # Return top results by relevance
-    return ranked_results[:MAX_RESULTS]
-
-
-# =============================================================================
-# LLM Summarization (STRICT - NO HALLUCINATION)
-# =============================================================================
-
-def _summarize_with_llm(query: str, results: list[dict], parsed: dict) -> str:
-    """
-    Use LLM to summarize search results.
-    
-    STRICT RULES:
-    - Only use information from the search results
-    - If info not found, say so clearly
-    - Never make up scores or events
-    
-    Args:
-        query: Original query.
-        results: Search results (already ranked by relevance).
-        parsed: Parsed query info.
-        
-    Returns:
-        Summary string.
-    """
-    client = _get_openai_client()
-    
-    # Build context from search results (include relevance for LLM context)
-    context_lines = []
-    for i, result in enumerate(results, 1):
-        relevance = result.get("_relevance_score", 0)
-        trust_indicator = "⭐" if relevance >= 40 else "📄"
-        
-        context_lines.append(f"[Source {i}] {trust_indicator} (relevance: {relevance:.0f}/100)")
-        context_lines.append(f"Title: {result.get('title', 'Unknown')}")
-        context_lines.append(f"Content: {result.get('snippet', '')}")
-        context_lines.append(f"URL: {result.get('url', '')}")
-        context_lines.append("")
-    
-    context = "\n".join(context_lines)
-    
-    home = parsed.get("home_team", "Unknown")
-    away = parsed.get("away_team", "Unknown")
-    date = parsed.get("date", "not specified")
-    competition = parsed.get("competition", "")
-    
-    system_prompt = """You are a football match information assistant.
-
-CRITICAL RULES - YOU MUST FOLLOW THESE:
-1. ONLY report information that is EXPLICITLY stated in the search results below
-2. If you cannot find the specific match score or result in the search results, say "I could not find information about this specific match"
-3. NEVER make up scores, dates, or match events
-4. NEVER guess or infer scores
-5. If the search results are about a DIFFERENT match (wrong teams or wrong date), say so
-6. Only mention scores/results if they are CLEARLY stated in the search results
-7. PRIORITIZE sources with higher relevance scores (marked with ⭐)
-
-If the search results don't contain the specific match requested, respond with:
-"I could not find verified information about [Team A] vs [Team B] on [date]. The search results may contain information about different matches between these teams."
-"""
-
-    comp_context = f" ({competition})" if competition else ""
-    user_message = f"""The user is looking for: {home} vs {away}{comp_context}
-Date requested: {date}
-
-Here are the search results, ranked by relevance (higher = more relevant):
-
-{context}
-
-Based ONLY on the search results above (do not make anything up):
-1. Is there information about the specific match requested ({home} vs {away})?
-2. If yes, what is the score and key information?
-3. If no, clearly state that you could not find this specific match.
-
-Remember: If you don't see the exact score in the search results, say you couldn't find it. Do NOT guess."""
-
-    print(f"[WebSearch] Sending to LLM for summarization...")
-    
-    response = client.chat.completions.create(
-        model=DEFAULT_LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.1,  # Very low temperature for factual responses
-        max_tokens=400,
-    )
-    
-    answer = response.choices[0].message.content
-    
-    print(f"[WebSearch] LLM response received")
-    
-    # Add sources with relevance indicators
-    answer += "\n\n📚 Sources (by relevance):"
-    for result in results[:4]:
-        url = result.get("url", "")
-        relevance = result.get("_relevance_score", 0)
-        if url:
-            # Determine source tier
-            tier = "🥇" if relevance >= 50 else "🥈" if relevance >= 30 else "📄"
-            answer += f"\n  {tier} {url}"
-    
-    return answer
-
-
-# =============================================================================
-# Main Entry Point
-# =============================================================================
-
-def search_and_summarize(query: str, use_llm: bool = True) -> str:
-    """
-    Search the web for match information and summarize.
-    
-    STRICT: Will not hallucinate. If match not found, says so.
-    
-    Uses intelligent relevance scoring to return highly relevant sources.
-    
-    Args:
-        query: Match query (e.g., "Arsenal vs Chelsea 2024-03-15").
-        use_llm: Whether to use LLM for summarization.
-        
-    Returns:
-        Summary string or "not found" message.
-    """
-    print(f"\n{'='*60}")
-    print(f"[WebSearch] STARTING SEARCH")
-    print(f"{'='*60}")
-    
-    # Parse the query
-    parsed = _parse_search_query(query)
-    
-    # Perform web search (with relevance scoring)
-    results = web_search(query)
-    
-    if not results:
-        print(f"[WebSearch] NO RELEVANT RESULTS FOUND")
-        blog_hits = _search_channel_blogs(parsed, max_results=4)
-        if blog_hits:
-            print(f"[WebSearch] Blog fallback found {len(blog_hits)} hits")
-            return _format_search_results(blog_hits)
-        return _not_found_message(query, parsed)
-    
-    # Log what we found with relevance scores
-    print(f"\n[WebSearch] Top relevant results:")
-    for i, r in enumerate(results, 1):
-        score = r.get("_relevance_score", 0)
-        print(f"  {i}. [Score: {score:.0f}] {r.get('title', 'No title')[:60]}...")
-    
-    if not use_llm:
-        return _format_search_results(results)
-    
-    # Use LLM to summarize (with strict anti-hallucination)
     try:
-        summary = _summarize_with_llm(query, results, parsed)
-        print(f"[WebSearch] SEARCH COMPLETE")
-        print(f"{'='*60}\n")
-        return summary
-    except Exception as e:
-        print(f"[WebSearch] LLM ERROR: {e}")
-        return _format_search_results(results)
-
-
-def _format_search_results(results: list[dict]) -> str:
-    """Format raw search results for display with relevance indicators."""
-    if not results:
-        return "No search results found."
-    
-    lines = ["🔍 Search Results (ranked by relevance):\n"]
-    
-    for i, result in enumerate(results, 1):
-        relevance = result.get("_relevance_score", 0)
-        tier = "🥇" if relevance >= 50 else "🥈" if relevance >= 30 else "📄"
-        
-        lines.append(f"{tier} {i}. {result.get('title', 'Untitled')}")
-        lines.append(f"   Relevance: {relevance:.0f}/100")
-        lines.append(f"   {result.get('snippet', '')[:200]}...")
-        if result.get("url"):
-            lines.append(f"   🔗 {result['url']}")
-        lines.append("")
-    
-    return "\n".join(lines)
-
-
-def _search_channel_blogs(parsed: dict, max_results: int = 4) -> list[dict]:
-    """
-    Fallback: search trusted blogs/news sites for match posts when primary web search is empty.
-    Uses match date (if available) to validate hits.
-    """
-    home = parsed.get("home_team", "")
-    away = parsed.get("away_team", "")
-    date = parsed.get("date", "")
-    
-    if not home and not away:
-        return []
-    
-    match_str = f"{home} vs {away}" if away else home
-    date_hint = date or "latest"
-    
-    queries = []
-    for source in BLOG_SOURCES:
-        queries.append(f"site:{source} {match_str} match report {date_hint}")
-        if date:
-            queries.append(f"site:{source} {match_str} {date}")
-    
-    seen_urls = set()
-    hits: list[dict] = []
-    
-    try:
-        from ddgs import DDGS
         with DDGS() as ddgs:
-            for q in queries:
-                print(f"[WebSearch][BlogFallback] Searching \"{q}\"")
-                for res in ddgs.text(q, max_results=max_results * 2):
-                    url = res.get("href", "")
-                    title = res.get("title", "")
-                    body = res.get("body", "")
-                    
-                    if not url or url in seen_urls:
-                        continue
-                    
-                    # If date is provided, require it to appear somewhere
-                    if date and date not in url and date not in title and date not in body:
-                        continue
-                    
-                    seen_urls.add(url)
-                    hits.append({
-                        "title": title,
-                        "snippet": body,
-                        "url": url,
-                        "_relevance_score": 35,  # modest default so formatting works
-                    })
-                    
-                    if len(hits) >= max_results:
-                        return hits
-    except ImportError:
-        print("[WebSearch][BlogFallback] ddgs not installed; skipping blog search")
-    except Exception as e:
-        print(f"[WebSearch][BlogFallback] Error: {e}")
-    
-    return hits
-
-
-def _not_found_message(query: str, parsed: dict) -> str:
-    """Return a message when no information is found."""
-    home = parsed.get("home_team", "the team")
-    away = parsed.get("away_team", "")
-    
-    match_str = f"{home} vs {away}" if away else home
-    
-    return (
-        f"❌ Could not find match information for \"{match_str}\".\n\n"
-        "This could mean:\n"
-        "• The match hasn't been played yet\n"
-        "• The match details aren't indexed by search engines yet\n"
-        "• Try specifying the exact date (YYYY-MM-DD)\n"
-        "• Try including the competition name (e.g., 'Champions League')"
-    )
-
-
-# =============================================================================
-# Intent-Aware Search and Summarize
-# =============================================================================
-
-def search_and_summarize_with_intent(
-    search_query: str,
-    intent: str,
-    summary_focus: str,
-    original_query: str
-) -> tuple[str, dict]:
-    """
-    Search the web and summarize based on user intent.
-    
-    Also extracts match metadata (teams, date) for YouTube search.
-    
-    Args:
-        search_query: Optimized search query from query parser.
-        intent: The detected intent (lineup, match_result, etc.)
-        summary_focus: What to emphasize in the summary.
-        original_query: The original user query for context.
-        
-    Returns:
-        Tuple of (summary_string, match_metadata_dict)
-        match_metadata contains: home_team, away_team, match_date, score
-    """
-    print(f"\n{'='*60}")
-    print(f"[WebSearch] INTENT-AWARE SEARCH")
-    print(f"{'='*60}")
-    print(f"[WebSearch] Query: \"{search_query}\"")
-    print(f"[WebSearch] Intent: {intent}")
-    print(f"[WebSearch] Focus: {summary_focus}")
-    
-    # Default match metadata
-    match_metadata = {
-        "home_team": None,
-        "away_team": None,
-        "match_date": None,
-        "score": None,
-    }
-    
-    # Perform web search
-    try:
-        from ddgs import DDGS
-        
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(search_query, max_results=8):
+            for r in ddgs.text(search_query, max_results=max_results):
                 results.append({
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", ""),
-                    "url": r.get("href", ""),
+                    "title": r.get("title", "") or "",
+                    "snippet": r.get("body", "") or "",
+                    "url": r.get("href", "") or "",
                 })
-        
-        print(f"[WebSearch] Found {len(results)} results")
-        
-    except ImportError:
-        return "❌ Error: ddgs library not installed. Run: pip install ddgs", match_metadata
     except Exception as e:
-        return f"❌ Search error: {e}", match_metadata
-    
-    if not results:
-        return f"❌ Could not find information for: {original_query}", match_metadata
-    
-    # Build context for LLM
-    context_lines = []
-    for i, result in enumerate(results, 1):
-        context_lines.append(f"[Source {i}]")
-        context_lines.append(f"Title: {result.get('title', 'Unknown')}")
-        context_lines.append(f"Content: {result.get('snippet', '')}")
-        context_lines.append(f"URL: {result.get('url', '')}")
-        context_lines.append("")
-    
-    context = "\n".join(context_lines)
-    
-    # Build intent-specific prompt
-    intent_instructions = _get_intent_instructions(intent, summary_focus)
-    
-    try:
-        client = _get_openai_client()
-        
-        # First, get the summary
-        system_prompt = f"""You are a football/soccer information assistant.
+        print(f"[WebSearch] Search error for {source or 'general'}: {e}")
 
-{intent_instructions}
-
-IMPORTANT RULES:
-1. ONLY use information from the search results provided
-2. If the specific information requested is not found, say so clearly
-3. NEVER make up scores, dates, names, or statistics
-4. Be concise but complete
-5. Use football/soccer terminology appropriately"""
-
-        user_message = f"""User's question: "{original_query}"
-
-Search results:
-{context}
-
-Based on the search results above, provide a summary focused on: {summary_focus}
-If the requested information is not in the results, say so clearly."""
-
-        response = client.chat.completions.create(
-            model=DEFAULT_LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.2,
-            max_tokens=600,
-        )
-        
-        answer = response.choices[0].message.content.strip()
-        
-        # Add sources
-        answer += "\n\n📚 Sources:"
-        for result in results[:3]:
-            url = result.get("url", "")
-            if url:
-                answer += f"\n  • {url}"
-        
-        # Now extract match metadata for YouTube search
-        if intent in ["match_result", "match_highlights"]:
-            match_metadata = _extract_match_metadata(context, original_query, client)
-        
-        return answer, match_metadata
-        
-    except Exception as e:
-        print(f"[WebSearch] LLM Error: {e}")
-        return _format_raw_results(results), match_metadata
+    return results
 
 
-def _extract_match_metadata(context: str, query: str, client) -> dict:
+# -----------------------------------------------------------------------------
+# Deterministic metadata extraction
+# -----------------------------------------------------------------------------
+def _extract_score_from_context(context: str,
+                                home_team: Optional[str],
+                                away_team: Optional[str]) -> Optional[str]:
     """
-    Extract match metadata (teams, date, score, key moments) from search results.
-    
-    This info is used to validate YouTube highlights and display match summary.
-    
-    Args:
-        context: Search results context.
-        query: Original user query.
-        client: OpenAI client.
-        
-    Returns:
-        dict with home_team, away_team, match_date, score, key_moments
+    Deterministically extract a score 'X-Y' from context.
+    Prefer scores that appear near the expected teams.
     """
+    if not context:
+        return None
+
+    text = context.lower().replace("–", "-")
+    home = (home_team or "").lower()
+    away = (away_team or "").lower()
+
+    score_hits: Dict[str, Dict[str, int]] = {}
+
+    for match in re.finditer(r'(\d{1,2})\s*-\s*(\d{1,2})', text):
+        score = f"{match.group(1)}-{match.group(2)}"
+        window_start = max(0, match.start() - 80)
+        window_end = min(len(text), match.end() + 80)
+        window = text[window_start:window_end]
+
+        priority = 0
+        if home and away and home in window and away in window:
+            priority = 2
+        elif (home and home in window) or (away and away in window):
+            priority = 1
+
+        hit = score_hits.get(score, {"count": 0, "priority": 0})
+        hit["count"] += 1
+        hit["priority"] = max(hit["priority"], priority)
+        score_hits[score] = hit
+
+    if not score_hits:
+        return None
+
+    best_score, best_meta = sorted(
+        score_hits.items(),
+        key=lambda item: (item[1]["priority"], item[1]["count"]),
+        reverse=True,
+    )[0]
+
+    # If we expected teams but never saw them near the score, treat as unreliable
+    if (home or away) and best_meta["priority"] == 0:
+        return None
+
+    return best_score
+
+
+def _extract_date_from_context(context: str, query: str) -> Optional[str]:
+    """
+    Extract a date from the context if possible, in YYYY-MM-DD format.
+    """
+    if not context:
+        return None
+
     try:
-        extraction_prompt = f"""From the search results below, extract the match information AND key moments.
+        patterns = [
+            r'(\d{4}-\d{2}-\d{2})',
+            r'(\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})',
+            r'((January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})',
+        ]
 
-Search results:
-{context}
+        candidates: List[Tuple[datetime, str]] = []
 
-User query: "{query}"
-
-Return ONLY valid JSON with these fields:
-{{
-    "home_team": "team that played at home (full name)",
-    "away_team": "team that played away (full name)",
-    "match_date": "YYYY-MM-DD format or null if not found",
-    "score": "X-X format (home-away) or null if not found. CRITICAL: Extract the score if it's mentioned anywhere in the search results. Look for patterns like '3-1', 'won 2-0', 'beat X-Y', 'final score', 'FT', 'full-time'. If score is mentioned, extract it.",
-    "competition": "Premier League/Champions League/La Liga/etc or null",
-    "key_moments": [
-        {{"minute": "45", "event": "GOAL", "description": "Actual player name scored for Team", "team": "home/away"}},
-        {{"minute": "67", "event": "RED_CARD", "description": "Actual player name sent off", "team": "home/away"}},
-        ...
-    ],
-    "man_of_the_match": "Actual player full name or null",
-    "match_summary": "Brief 1-2 sentence summary of the match"
-}}
-
-CRITICAL REQUIREMENTS - KEY MOMENTS ARE THE HIGHEST PRIORITY:
-1. **KEY MOMENTS EXTRACTION IS CRITICAL** - This is the most important part of the extraction.
-   - You MUST extract ALL key moments mentioned in the search results
-   - For EVERY key moment, you MUST extract the ACTUAL player name
-   - DO NOT use placeholders like "Player Name", "Player", "Unknown", or generic terms
-   - If a player name is mentioned anywhere in the search results, use it exactly as written
-   - If multiple sources mention the same event, use the most complete information
-   - Example: If the text says "Mohamed Salah scored", use "Mohamed Salah scored for Liverpool"
-   - Example: If the text says "goal by Salah", use "Salah scored for Liverpool"
-   - Example: If the text says "red card for [Player Name]", search the context more carefully - the name is likely there
-   - If you see "sent off", "dismissed", "red card", look for the player name in the same sentence or nearby sentences
-
-2. **RED CARDS ARE ESPECIALLY IMPORTANT** - Users often ask about red cards specifically
-   - If a red card is mentioned, you MUST find the player name
-   - Look in match reports, summaries, and key moments sections
-   - Check for phrases like "sent off", "dismissed", "red card", "ejected"
-   - The player name is almost always mentioned in the same context
-
-3. For man_of_the_match, extract the ACTUAL player name if mentioned, otherwise use null.
-
-4. Key moments should include (in order of importance):
-   - **Red cards** (with ACTUAL player name - CRITICAL)
-   - Goals (with ACTUAL scorer name and minute if available)
-   - Penalties (scored or missed, with ACTUAL player name)
-   - Own goals (with ACTUAL player name)
-   - Yellow cards (if significant, with ACTUAL player name)
-   - Key saves or near misses (with ACTUAL player name if mentioned)
-   - VAR decisions (with ACTUAL player name if mentioned)
-   - Substitutions of key players (if mentioned)
-
-5. **SEARCH THOROUGHLY** - Read through ALL the search results carefully
-   - Player names are often in match reports, summaries, or key moments sections
-   - Don't give up - if a red card is mentioned, the player name is likely in the text
-   - Check multiple sources if available
-
-6. Be precise and extract only information that is actually in the search results.
-   Do not make up player names or use placeholders.
-
-5. SCORE EXTRACTION IS CRITICAL:
-   - Look carefully for score patterns: "3-1", "won 2-0", "beat 1-0", "final score 2-2", "FT: 1-1"
-   - Check match reports, headlines, and summaries for score information
-   - If a score is mentioned anywhere (even in video titles or snippets), extract it
-   - Format as "X-Y" where X is home team goals, Y is away team goals
-   - If multiple scores are mentioned, use the final/full-time score
-   - If no score is found after careful search, use null
-
-Today's date is {datetime.now().strftime("%Y-%m-%d")}."""
-
-        response = client.chat.completions.create(
-            model=DEFAULT_LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "Extract match information and key moments as JSON. Be precise and comprehensive. NEVER use placeholder text like 'Player Name' - always extract actual player names from the source material or use 'Unknown player' if not available. CRITICALLY IMPORTANT: Extract the score if it appears anywhere in the search results - look for patterns like '3-1', 'won 2-0', 'beat X-Y', 'final score', 'FT', 'full-time score'. If a score is mentioned, you MUST extract it."},
-                {"role": "user", "content": extraction_prompt}
-            ],
-            temperature=0,
-            max_tokens=800,  # Increased to allow for more detailed extraction
-        )
-        
-        answer = response.choices[0].message.content.strip()
-        
-        # Clean up JSON
-        if answer.startswith("```"):
-            answer = answer.split("```")[1]
-            if answer.startswith("json"):
-                answer = answer[4:]
-        answer = answer.strip()
-        
-        import json
-        metadata = json.loads(answer)
-        
-        # Validate and clean player names in key moments
-        key_moments = metadata.get('key_moments', [])
-        cleaned_moments = []
-        for moment in key_moments:
-            description = moment.get('description', '')
-            # Check if description contains placeholder text
-            if 'Player Name' in description or description.lower() == 'player name':
-                # Try to extract from context or mark as unknown
-                description = description.replace('Player Name', 'Unknown player')
-                description = description.replace('player name', 'Unknown player')
-            cleaned_moments.append({
-                **moment,
-                'description': description
-            })
-        metadata['key_moments'] = cleaned_moments
-        
-        # Validate man of the match
-        motm = metadata.get('man_of_the_match', '')
-        if motm and ('Player Name' in motm or motm.lower() == 'player name'):
-            metadata['man_of_the_match'] = None
-        
-        print(f"[WebSearch] Extracted match metadata:")
-        print(f"[WebSearch]   Home: {metadata.get('home_team')}")
-        print(f"[WebSearch]   Away: {metadata.get('away_team')}")
-        print(f"[WebSearch]   Date: {metadata.get('match_date')}")
-        print(f"[WebSearch]   Score: {metadata.get('score')}")
-        
-        # Log key moments with validation
-        if key_moments:
-            print(f"[WebSearch]   Key moments: {len(key_moments)} events found")
-            for moment in key_moments[:5]:
-                desc = moment.get('description', '')
-                # Warn if placeholder detected
-                if 'Player Name' in desc or desc.lower() == 'player name':
-                    print(f"[WebSearch]     ⚠️  WARNING: Placeholder detected in: {moment.get('minute', '?')}' {moment.get('event', 'EVENT')}")
+        for pattern in patterns:
+            for match in re.findall(pattern, context, re.IGNORECASE):
+                if isinstance(match, tuple):
+                    raw = match[0]
                 else:
-                    print(f"[WebSearch]     - {moment.get('minute', '?')}' {moment.get('event', 'EVENT')}: {desc[:60]}")
-        
-        return metadata
-        
+                    raw = match
+                raw = raw.strip()
+                try:
+                    if re.match(r"\d{4}-\d{2}-\d{2}$", raw):
+                        dt = datetime.strptime(raw, "%Y-%m-%d")
+                    else:
+                        dt = None
+                        for fmt in ("%d %B %Y", "%B %d %Y", "%B %d, %Y"):
+                            try:
+                                dt = datetime.strptime(raw, fmt)
+                                break
+                            except ValueError:
+                                dt = None
+                        if dt is None:
+                            continue
+                    candidates.append((dt, raw))
+                except Exception:
+                    continue
+
+        if candidates:
+            today = datetime.now()
+            past = [(dt, raw) for dt, raw in candidates if dt <= today]
+            if past:
+                past.sort(key=lambda x: x[0], reverse=True)
+                return past[0][0].strftime("%Y-%m-%d")
+
+        # Relative "yesterday"
+        if "yesterday" in _safe_lower(query) or "yesterday" in _safe_lower(context):
+            return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
     except Exception as e:
-        print(f"[WebSearch] Error extracting metadata: {e}")
-        return {
-            "home_team": None,
-            "away_team": None,
-            "match_date": None,
-            "score": None,
-            "competition": None,
-            "key_moments": [],
-            "man_of_the_match": None,
-            "match_summary": None,
+        print(f"[WebSearch] Date extraction error: {e}")
+
+    return None
+
+
+def _resolve_expected_teams(parsed_query: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Use parsed_query (from query_parser_agent) to figure out expected home/away.
+    We assume teams[0] = home, teams[1] = away if present, but this can be
+    corrected later based on context.
+    """
+    if not parsed_query:
+        return None, None
+
+    teams = parsed_query.get("teams") or []
+    home_team = teams[0] if len(teams) >= 1 else None
+    away_team = teams[1] if len(teams) >= 2 else None
+    return home_team, away_team
+
+
+def _maybe_correct_team_order_with_score(context: str,
+                                         score: Optional[str],
+                                         home_team: Optional[str],
+                                         away_team: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Fix cases like:
+      - query: "chelsea leeds"
+      - parsed teams: home=Chelsea, away=Leeds
+      - article: "Leeds 3-1 Chelsea"
+
+    If context clearly contains "<Away> score <Home>" but not "<Home> score <Away>",
+    swap home/away so metadata matches the article (Leeds 3-1 Chelsea).
+    """
+    if not (context and score and home_team and away_team):
+        return home_team, away_team
+
+    text = context.lower().replace("–", "-")
+    h = home_team.lower()
+    a = away_team.lower()
+    s = score.replace("–", "-")
+
+    # Allow some punctuation/words between team and score
+    pattern_home_first = re.compile(
+        rf"{re.escape(h)}[^\d]{{0,20}}{re.escape(s)}[^\w]{{0,20}}{re.escape(a)}",
+        re.IGNORECASE,
+    )
+    pattern_away_first = re.compile(
+        rf"{re.escape(a)}[^\d]{{0,20}}{re.escape(s)}[^\w]{{0,20}}{re.escape(h)}",
+        re.IGNORECASE,
+    )
+
+    home_first = bool(pattern_home_first.search(text))
+    away_first = bool(pattern_away_first.search(text))
+
+    # If only the reversed ordering appears, swap
+    if away_first and not home_first:
+        print("[WebSearch] Detected score pattern with reversed team order – swapping home/away")
+        return away_team, home_team
+
+    return home_team, away_team
+
+
+# -----------------------------------------------------------------------------
+# Goal / key-moment extraction
+# -----------------------------------------------------------------------------
+def _extract_goal_events_from_context(context: str,
+                                      home_team: Optional[str],
+                                      away_team: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Extract goal events as key moments from article text.
+
+    Very conservative: only returns events when we see an explicit pattern,
+    e.g. "Bamford (23')" or "in the 23rd minute, Patrick Bamford scored".
+
+    Returns list of dicts:
+      { "minute": "23'", "event": "Goal",
+        "description": "...", "team": "Leeds" }
+    """
+    if not context:
+        return []
+
+    text = context.replace("–", "-")
+    lower = text.lower()
+    home = (home_team or "").lower()
+    away = (away_team or "").lower()
+
+    moments: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    # Pattern 1: "Name (23')" or "Name (23rd minute)"
+    pat1 = re.compile(
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s*\(\s*(\d{1,2})\s*(?:\'|’)?',
+        re.MULTILINE,
+    )
+    # Pattern 2: "23rd-minute strike from Name" or "23rd minute from Name"
+    pat2 = re.compile(
+        r'(\d{1,2})(?:st|nd|rd|th)?-?\s*minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Pattern 3: "in the 23rd minute, Name scored"
+    pat3 = re.compile(
+        r'in the (\d{1,2})(?:st|nd|rd|th)? minute[^\.]{0,60}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def _infer_team_for_name(idx: int, scorer_name: str) -> Optional[str]:
+        """
+        Look in a small window around idx to see if 'chelsea' or 'leeds'
+        is mentioned near the scorer.
+        """
+        window_start = max(0, idx - 120)
+        window_end = min(len(lower), idx + 120)
+        window = lower[window_start:window_end]
+
+        if home and home in window and (not away or away not in window):
+            return home_team
+        if away and away in window and (not home or home not in window):
+            return away_team
+        # If both or neither appear, do not guess.
+        return None
+
+    # Helper to register a moment
+    def _add_moment(minute: str, name: str, idx: int):
+        key = (minute, name)
+        if key in moments:
+            return
+        team = _infer_team_for_name(idx, name)
+        minute_label = f"{minute}'"
+        desc_team = team or "Unknown team"
+        description = f"GOAL for {desc_team}: {name} scores in the {minute}th minute."
+        moments[key] = {
+            "minute": minute_label,
+            "event": "Goal",
+            "description": description,
+            "team": team,
         }
 
+    for m in pat1.finditer(text):
+        name = m.group(1).strip()
+        minute = m.group(2)
+        _add_moment(minute, name, m.start())
 
-def _extract_date_from_context(context: str, query: str):
-    """
-    Extract match date from search results context.
-    
-    Args:
-        context: Search results context.
-        query: Original query.
-        
-    Returns:
-        Date in YYYY-MM-DD format or None.
-    """
+    for m in pat2.finditer(text):
+        minute = m.group(1)
+        name = m.group(2).strip()
+        _add_moment(minute, name, m.start())
+
+    for m in pat3.finditer(text):
+        minute = m.group(1)
+        name = m.group(2).strip()
+        _add_moment(minute, name, m.start())
+
+    # Sort by minute numerically
+    result = list(moments.values())
     try:
-        from datetime import datetime, timedelta
-        import re
-        
-        # Look for date patterns in context
-        date_patterns = [
-            r'(\d{4}-\d{2}-\d{2})',  # YYYY-MM-DD
-            r'(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})',  # DD Month YYYY
-            r'((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})',  # Month DD, YYYY
-        ]
-        
-        for pattern in date_patterns:
-            matches = re.findall(pattern, context, re.IGNORECASE)
-            if matches:
-                # Try to parse and return the most recent date
-                dates = []
-                for match in matches:
-                    try:
-                        if '-' in match:
-                            dt = datetime.strptime(match, '%Y-%m-%d')
-                        else:
-                            # Try different formats
-                            for fmt in ['%B %d, %Y', '%d %B %Y', '%B %d %Y']:
-                                try:
-                                    dt = datetime.strptime(match, fmt)
-                                    break
-                                except:
-                                    continue
-                            else:
-                                continue
-                        dates.append((dt, match))
-                    except:
-                        continue
-                
-                if dates:
-                    # Return the most recent date (closest to today but not in future)
-                    today = datetime.now()
-                    valid_dates = [(dt, match) for dt, match in dates if dt <= today]
-                    if valid_dates:
-                        # Sort by date, most recent first
-                        valid_dates.sort(key=lambda x: x[0], reverse=True)
-                        return valid_dates[0][0].strftime('%Y-%m-%d')
-        
-        # Check for relative dates like "yesterday"
-        yesterday = datetime.now() - timedelta(days=1)
-        if 'yesterday' in query.lower() or 'yesterday' in context.lower():
-            return yesterday.strftime('%Y-%m-%d')
-        
-        return None
-        
-    except Exception as e:
-        print(f"[RAG] Error extracting date: {e}")
-        return None
+        result.sort(key=lambda x: int(re.sub(r"[^0-9]", "", x["minute"]) or 0))
+    except Exception:
+        pass
+
+    print(f"[WebSearch] Extracted {len(result)} goal events from context")
+    return result
 
 
-def _get_intent_instructions(intent: str, summary_focus: str) -> str:
-    """Get intent-specific instructions for the LLM."""
-    
-    instructions = {
-        "match_result": """Focus on providing:
-- The final score
-- Key goalscorers and times
-- Notable moments (red cards, penalties, etc.)
-- Brief context about what the result means""",
-        
-        "match_highlights": """Focus on:
-- The score and result
-- Key moments that would be in highlights
-- Goalscorers and notable plays""",
-        
-        "lineup": """Focus on providing:
-- Starting XI for both teams if available
-- Formation used
-- Notable player inclusions/exclusions
-- Any tactical notes
-Do NOT focus on the match result unless asked.""",
-        
-        "player_info": """Focus on:
-- Recent performances
-- Statistics (goals, assists, etc.)
-- Current form
-- Any news about the player""",
-        
-        "transfer_news": """Focus on:
-- Latest transfer rumors and confirmed deals
-- Fee details if available
-- Agent/club statements
-- Timeline information""",
-        
-        "team_news": """Focus on:
-- Latest news about the team
-- Injury updates
-- Manager comments
-- Recent results or upcoming fixtures""",
-        
-        "standings": """Focus on:
-- Current league positions
-- Points totals
-- Recent form
-- Key battles for positions""",
-        
-        "fixtures": """Focus on:
-- Upcoming match dates and times
-- Opponents
-- Competition (league, cup, etc.)
-- Venue information""",
-        
-        "stats": """Focus on:
-- Specific statistics requested
-- Comparisons if relevant
-- Context for the numbers""",
-        
-        "general": """Provide a comprehensive summary of the relevant information found."""
+def _build_match_metadata_from_context(context: str,
+                                       original_query: str,
+                                       parsed_query: Optional[dict]) -> dict:
+    """
+    Deterministic metadata:
+    - home_team / away_team start from parsed_query
+    - score and date extracted via regex
+    - team order corrected if article shows reversed order
+    - key_moments populated with goal scorers when patterns are explicit
+    """
+    home_team, away_team = _resolve_expected_teams(parsed_query)
+
+    raw_score = _extract_score_from_context(context, home_team, away_team)
+    match_date = _extract_date_from_context(context, original_query)
+
+    # Correct orientation if context clearly indicates reversed order
+    home_team, away_team = _maybe_correct_team_order_with_score(
+        context=context,
+        score=raw_score,
+        home_team=home_team,
+        away_team=away_team,
+    )
+
+    # NEW: goal → key_moments extraction
+    key_moments = _extract_goal_events_from_context(context, home_team, away_team)
+
+    metadata = {
+        "home_team": home_team,
+        "away_team": away_team,
+        "match_date": match_date,
+        "score": raw_score,
+        "competition": parsed_query.get("competition") if parsed_query else None,
+        "key_moments": key_moments,
+        "man_of_the_match": None,
+        "match_summary": None,
     }
-    
-    return instructions.get(intent, instructions["general"])
+
+    print("[WebSearch] Extracted metadata (deterministic):")
+    print(f"  Home: {metadata['home_team']}")
+    print(f"  Away: {metadata['away_team']}")
+    print(f"  Date: {metadata['match_date']}")
+    print(f"  Score: {metadata['score']}")
+    print(f"  Key moments: {len(metadata['key_moments'])}")
+    return metadata
 
 
-def _format_raw_results(results: list[dict]) -> str:
-    """Format raw search results as fallback."""
-    lines = ["🔍 Search Results:\n"]
-    
-    for i, result in enumerate(results[:5], 1):
-        lines.append(f"{i}. {result.get('title', 'Untitled')}")
-        lines.append(f"   {result.get('snippet', '')[:200]}...")
-        if result.get("url"):
-            lines.append(f"   🔗 {result['url']}")
-        lines.append("")
-    
-    return "\n".join(lines)
-
-
-# =============================================================================
-# RAG: Chunk, Index, and Retrieve
-# =============================================================================
-
-def _chunk_search_results(results: list[dict], query_id: str) -> list[dict]:
-    """
-    Chunk search results for RAG indexing.
-    
-    Each search result becomes one chunk with metadata.
-    
-    Args:
-        results: List of search results.
-        query_id: Unique ID for this query session.
-        
-    Returns:
-        List of chunks ready for embedding.
-    """
-    chunks = []
-    
-    for i, result in enumerate(results):
-        title = result.get("title", "")
-        snippet = result.get("snippet", "")
-        url = result.get("url", "")
-        
-        # Combine title and snippet as chunk text
-        chunk_text = f"Title: {title}\nContent: {snippet}\nSource: {url}"
-        
+# -----------------------------------------------------------------------------
+# RAG: chunk, index, retrieve
+# -----------------------------------------------------------------------------
+def _chunk_search_results(results: List[dict], query_id: str) -> List[dict]:
+    chunks: List[dict] = []
+    for i, r in enumerate(results):
+        text = f"Title: {r.get('title','')}\nContent: {r.get('snippet','')}\nSource: {r.get('url','')}"
         chunks.append({
             "id": f"{query_id}_{i}",
-            "text": chunk_text,
+            "text": text,
             "metadata": {
                 "query_id": query_id,
-                "source_url": url,
-                "title": title,
+                "source_url": r.get("url", ""),
+                "title": r.get("title", ""),
                 "chunk_index": i,
             }
         })
-    
     return chunks
 
 
-def _index_chunks_for_rag(chunks: list[dict]) -> None:
-    """
-    Index chunks into ChromaDB for RAG retrieval.
-    
-    Args:
-        chunks: List of chunks with id, text, and metadata.
-    """
-    if not chunks or not RAG_AVAILABLE:
+def _index_chunks_for_rag(chunks: List[dict]) -> None:
+    if not (chunks and RAG_AVAILABLE):
         return
-    
     try:
         collection = _get_collection()
         model = _get_embedding_model()
-        
-        # Prepare for ChromaDB
+
         ids = [c["id"] for c in chunks]
-        documents = [c["text"] for c in chunks]
-        metadatas = [c["metadata"] for c in chunks]
-        
-        # Generate embeddings
-        embeddings = model.encode(documents, show_progress_bar=False).tolist()
-        
-        # Add to collection
-        collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
-        
+        docs = [c["text"] for c in chunks]
+        metas = [c["metadata"] for c in chunks]
+        embs = model.encode(docs, show_progress_bar=False).tolist()
+
+        collection.add(ids=ids, documents=docs, embeddings=embs, metadatas=metas)
         print(f"[RAG] Indexed {len(chunks)} chunks")
-        
     except Exception as e:
         print(f"[RAG] Indexing error: {e}")
 
 
-def _retrieve_relevant_context(query: str, query_id: str, chunks: list[dict], k: int = 5) -> list[dict]:
-    """
-    Retrieve relevant chunks using semantic search OR simple fallback.
-    
-    Args:
-        query: The user's question.
-        query_id: Query session ID to filter results.
-        chunks: Original chunks (used as fallback if RAG not available).
-        k: Number of chunks to retrieve.
-        
-    Returns:
-        List of relevant chunks with text and metadata.
-    """
+def _retrieve_relevant_context(query: str,
+                               query_id: str,
+                               chunks: List[dict],
+                               k: int = 5) -> List[dict]:
     if RAG_AVAILABLE:
         try:
             collection = _get_collection()
             model = _get_embedding_model()
-            
-            # Embed the query
-            query_embedding = model.encode(query, show_progress_bar=False).tolist()
-            
-            # Query ChromaDB
-            results = collection.query(
-                query_embeddings=[query_embedding],
+            q_emb = model.encode(query, show_progress_bar=False).tolist()
+            res = collection.query(
+                query_embeddings=[q_emb],
                 n_results=k,
                 where={"query_id": query_id},
                 include=["documents", "metadatas"],
             )
-            
-            # Format results
-            retrieved = []
-            if results["documents"] and results["documents"][0]:
-                for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+
+            retrieved: List[dict] = []
+            if res["documents"] and res["documents"][0]:
+                for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
                     retrieved.append({
                         "text": doc,
                         "source": meta.get("source_url", ""),
                         "title": meta.get("title", ""),
                     })
-            
-            print(f"[RAG] Retrieved {len(retrieved)} relevant chunks via embeddings")
+            print(f"[RAG] Retrieved {len(retrieved)} chunks via embeddings")
             return retrieved
-            
         except Exception as e:
-            print(f"[RAG] Retrieval error: {e}, using fallback")
-    
-    # Fallback: just use all chunks
-    print(f"[RAG] Using simple context (no embeddings)")
-    return [{"text": c["text"], "source": c["metadata"].get("source_url", ""), "title": c["metadata"].get("title", "")} for c in chunks[:k]]
+            print(f"[RAG] Retrieval error: {e} – falling back to simple context")
+
+    print("[RAG] Using simple context (no embeddings)")
+    return [{
+        "text": c["text"],
+        "source": c["metadata"].get("source_url", ""),
+        "title": c["metadata"].get("title", "")
+    } for c in chunks[:k]]
 
 
-def _search_with_source(query: str, source: Optional[str] = None, max_results: int = 10) -> list[dict]:
-    """
-    Search with optional source restriction.
-    
-    Args:
-        query: Search query.
-        source: Optional source site (e.g., "espn.com", "bbc.com").
-        max_results: Maximum results to return.
-        
-    Returns:
-        List of search results.
-    """
-    try:
-        from ddgs import DDGS
-        
-        results = []
-        search_query = f"site:{source} {query}" if source else query
-        
-        with DDGS() as ddgs:
-            for r in ddgs.text(search_query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", ""),
-                    "url": r.get("href", ""),
-                })
-        
-        return results
-    except Exception as e:
-        print(f"[RAG] Search error for {source or 'general'}: {e}")
-        return []
+# -----------------------------------------------------------------------------
+# Intent-specific instructions for LLM summarisation
+# -----------------------------------------------------------------------------
+def _get_intent_instructions(intent: str, summary_focus: str) -> str:
+    base = {
+        "match_result": """Focus on:
+- final score
+- goalscorers and timings if present
+- key moments (red cards, penalties)
+- what the result means (briefly)""",
+        "match_highlights": """Focus on:
+- score and overall result
+- moments that would appear in highlights (goals, big chances, red cards)""",
+        "team_news": """Focus on:
+- latest news
+- injuries, manager comments
+- recent form""",
+        "transfer_news": """Focus on:
+- confirmed transfers and serious rumours
+- fees / contract details if present""",
+    }.get(intent, "Provide a concise, factual summary of the retrieved information.")
+
+    return base + f"\n\nUser requested focus: {summary_focus or 'key information'}."
 
 
-def search_with_rag(query: str, intent: str, original_query: str, parsed_query: Optional[dict] = None) -> tuple[str, dict]:
+# -----------------------------------------------------------------------------
+# MAIN: RAG search pipeline
+# -----------------------------------------------------------------------------
+def search_with_rag(
+    query: str,
+    intent: str,
+    original_query: str,
+    parsed_query: Optional[dict] = None,
+) -> tuple[str, dict]:
     """
-    Full RAG pipeline: Search -> Chunk -> Index -> Retrieve -> Generate.
-    
-    For match results, if score is not found, dynamically searches multiple sources
-    (Guardian, ESPN, BBC, Sky Sports) up to 4 times before giving up.
-    
-    Args:
-        query: Optimized search query.
-        intent: Query intent.
-        original_query: Original user question.
-        
-    Returns:
-        Tuple of (answer, match_metadata).
+    Full RAG pipeline:
+    - web search (ddgs)
+    - chunk + optional embeddings index
+    - retrieve most relevant chunks
+    - summarise with LLM
+    - deterministically extract match metadata (score/date + corrected team order + goal key moments)
+
+    Returns: (answer_text, match_metadata_dict)
     """
-    print(f"\n{'='*60}")
-    print(f"[RAG] Starting RAG Pipeline")
-    print(f"{'='*60}")
-    # Bias RAG searches toward men's football to avoid women's results bleed-through
-    men_bias = " men -women -wsl -femenil -feminine"
-    biased_query = f"{query}{men_bias}"
-    # For match results/highlights, emphasize minute-by-minute style sources
-    if intent in ["match_result", "match_highlights"]:
-        biased_query = f"{biased_query} minute minute-by-minute goals"
-    print(f"[RAG] Query: \"{biased_query}\"")
-    
-    # Log and pre-fill metadata from the main query parser agent (if provided)
+    print("\n" + "=" * 60)
+    print("[RAG] Starting RAG pipeline")
+    print("=" * 60)
+
+    teams = (parsed_query.get("teams") if parsed_query else []) or []
+    home_team = teams[0] if len(teams) > 0 else None
+    away_team = teams[1] if len(teams) > 1 else None
+
+    # Bias query to men's latest match for match_result / highlights
+    biased_query = query
+    if intent in ("match_result", "match_highlights"):
+        year = datetime.now().year
+        biased_query = f"{query} latest match result score {year} men"
+
+    print(f"[RAG] Biased query: \"{biased_query}\"")
     if parsed_query:
-        print(f"[RAG] Parsed query (from query_parser_agent):")
-        print(f"[RAG]   Intent: {parsed_query.get('intent')}")
-        print(f"[RAG]   Teams: {parsed_query.get('teams')}")
-        print(f"[RAG]   Competition: {parsed_query.get('competition')}")
-        print(f"[RAG]   Date context: {parsed_query.get('date_context')}")
-        print(f"[RAG]   Is most recent: {parsed_query.get('is_most_recent')}")
-    
-    match_metadata = {
-        "home_team": (parsed_query.get("teams") or [None, None])[0] if parsed_query else None,
-        "away_team": (parsed_query.get("teams") or [None, None])[1] if parsed_query and len(parsed_query.get("teams", [])) > 1 else None,
-        "match_date": parsed_query.get("date") if parsed_query else None,
-        "score": None,
-        "competition": parsed_query.get("competition") if parsed_query else None,
-    }
-    
-    # Define source search order for match results
-    match_result_sources = [
-        None,  # General search first
-        "espn.com",
-        "bbc.com/sport",
-        "skysports.com",
-        "theguardian.com/football",
-    ]
-    
-    # For news intents, prioritize Guardian
-    news_sources = [
-        None,  # General search first
-        "theguardian.com/football",
-        "espn.com",
-        "bbc.com/sport",
-    ]
-    
-    # Choose source list based on intent
-    if intent in ["team_news", "transfer_news"]:
-        sources_to_try = news_sources
-    elif intent in ["match_result", "match_highlights"]:
-        sources_to_try = match_result_sources
-    else:
-        sources_to_try = [None]  # Just general search
-    
-    # Step 1: Web Search with retry logic
-    all_results = []
-    seen_urls = set()
-    
-    try:
-        from ddgs import DDGS
-        
-        for source in sources_to_try[:4]:  # Max 4 tries
-            if source:
-                print(f"[RAG] Searching {source}...")
-                source_results = _search_with_source(biased_query, source, max_results=8)
-            else:
-                print(f"[RAG] General search...")
-                source_results = _search_with_source(biased_query, None, max_results=10)
-            
-            # Add unique results
-            for r in source_results:
-                url = r.get("url", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    all_results.append(r)
-            
-            # If we have enough results, we can proceed
-            if len(all_results) >= 10:
-                break
-        
-        print(f"[RAG] Step 1: Found {len(all_results)} total search results from {len(sources_to_try[:4])} sources")
-        
-    except Exception as e:
-        return f"❌ Search error: {e}", match_metadata
-    
+        print(f"[RAG] Parsed query:")
+        print(f"  Intent: {parsed_query.get('intent')}")
+        print(f"  Teams:  {parsed_query.get('teams')}")
+        print(f"  Competition: {parsed_query.get('competition')}")
+        print(f"  Date context: {parsed_query.get('date_context')}")
+        print(f"  Is most recent: {parsed_query.get('is_most_recent')}")
+
+    # Step 1 – web search
+    all_results: List[dict] = []
+    seen_urls: set[str] = set()
+    search_sources = [None, "espn.com", "bbc.com/sport", "theguardian.com/football"]
+
+    for source in search_sources:
+        results = _search_with_source(biased_query, source, max_results=6)
+        for r in results:
+            url = r.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_results.append(r)
+
+        if len(all_results) >= MAX_RESULTS:
+            break
+
+    print(f"[RAG] Step 1: collected {len(all_results)} search results")
+
     if not all_results:
-        return f"❌ No results found for: {original_query}", match_metadata
-    
-    # Step 2: Chunk and Index
+        metadata = {
+            "home_team": home_team,
+            "away_team": away_team,
+            "match_date": None,
+            "score": None,
+            "competition": parsed_query.get("competition") if parsed_query else None,
+            "key_moments": [],
+            "man_of_the_match": None,
+            "match_summary": None,
+        }
+        return f"❌ No results found for: {original_query}", metadata
+
+    # Step 2 – chunk + index
     query_id = hashlib.md5(f"{biased_query}_{datetime.now().isoformat()}".encode()).hexdigest()[:12]
     chunks = _chunk_search_results(all_results, query_id)
     _index_chunks_for_rag(chunks)
-    print(f"[RAG] Step 2: Chunked {len(chunks)} results")
-    
-    # Step 3: Retrieve relevant context (semantic search or fallback)
+    print(f"[RAG] Step 2: chunked {len(chunks)} results")
+
+    # Step 3 – retrieve relevant context
     relevant_chunks = _retrieve_relevant_context(original_query, query_id, chunks, k=5)
-    print(f"[RAG] Step 3: Using {len(relevant_chunks)} context chunks")
-    
-    # Step 4: Generate answer from retrieved context
-    context = "\n\n".join([f"[Source: {c.get('title', 'Unknown')}]\n{c['text']}" for c in relevant_chunks])
-    
-    try:
-        client = _get_openai_client()
-        
-        intent_instructions = _get_intent_instructions(intent, "key information")
-        
-        system_prompt = f"""You are a football information assistant using RAG (Retrieval Augmented Generation).
+    print(f"[RAG] Step 3: using {len(relevant_chunks)} chunks as context")
+
+    context = "\n\n".join(
+        f"[Source: {c.get('title','Unknown')}]\n{c['text']}" for c in relevant_chunks
+    )
+
+    # Step 4 – LLM summary (STRICT: no fabrication)
+    client = _get_openai_client()
+    intent_instructions = _get_intent_instructions(intent, "key information")
+
+    system_prompt = f"""You are a football/soccer information assistant using RAG.
 
 {intent_instructions}
 
-CRITICAL RAG RULES:
-1. ONLY use information from the retrieved context below
-2. If information is not in the context, say "I couldn't find this information" or "This information was not found in the available sources"
-3. NEVER make up facts, scores, dates, or statistics
-4. If a score is not in the context, DO NOT invent one - say the score was not found
-5. **EMPHASIZE KEY MOMENTS** - If key moments are available (goals, red cards, etc.), make them prominent in your summary
-6. **PLAYER NAMES ARE CRITICAL** - Always include actual player names for key events (goals, red cards, etc.)
-7. Cite your sources when possible
-8. Be honest about what information is missing"""
+STRICT RULES:
+1. Only use information that appears in the provided context.
+2. If a score is not clearly present, say the score was not found.
+3. Do NOT guess or invent scores, dates, player names or events.
+4. If you are unsure about a detail, say explicitly that it is not available.
+"""
 
-        user_message = f"""Question: {original_query}
+    user_message = f"""User question: {original_query}
 
-Retrieved Context:
+Context:
 {context}
 
-Based on the retrieved context above, answer the question. 
+Based ONLY on the context above, answer the user's question.
+If the requested information is missing, say so clearly."""
 
-IMPORTANT: 
-- If key moments are mentioned (goals, red cards, etc.), make them a prominent part of your answer
-- Always include player names for key events if they are in the context
-- If the score or requested information is not in the context, explicitly state that it was not found."""
-
-        response = client.chat.completions.create(
+    try:
+        resp = client.chat.completions.create(
             model=DEFAULT_LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1714,200 +626,58 @@ IMPORTANT:
             temperature=0.2,
             max_tokens=600,
         )
-        
-        answer = response.choices[0].message.content.strip()
-        print(f"[RAG] Step 4: Generated answer")
-        
-        # Add sources
-        sources = set(c.get("source", "") for c in relevant_chunks if c.get("source"))
-        if sources:
-            answer += "\n\n📚 Sources:"
-            for src in list(sources)[:3]:
-                answer += f"\n  • {src}"
-        
-        # Extract match metadata if this is a match result query
-        if intent in ["match_result", "match_highlights"]:
-            match_metadata = _extract_match_metadata(context, original_query, client)
-            
-            # Check if key moments have missing player names
-            key_moments = match_metadata.get('key_moments', [])
-            has_unknown_players = any(
-                'unknown player' in moment.get('description', '').lower() or 
-                'player name' in moment.get('description', '').lower()
-                for moment in key_moments
-            )
-            missing_key_moments = not key_moments
-            
-            # If key moments are missing or have missing player names, search more sources
-            if (missing_key_moments or has_unknown_players) and (match_metadata.get('home_team') or match_metadata.get('away_team')):
-                print(f"[RAG] Key moments incomplete, searching additional sources for scorers...")
-                home_team = match_metadata.get('home_team', '')
-                away_team = match_metadata.get('away_team', '')
-                match_date = match_metadata.get('match_date', '')
-                
-                if home_team and away_team:
-                    # Build detailed match query for key moments
-                    match_query = f"{home_team} vs {away_team}"
-                    if match_date:
-                        match_query += f" {match_date}"
-                    match_query += " goals scorers key moments red cards men -women -wsl -femenil -feminine"
-                    
-                    # Try additional sources for key moments (include score-focused sites)
-                    additional_sources = [
-                        "espn.com",
-                        "bbc.com/sport",
-                        "skysports.com",
-                        "theguardian.com/football",
-                        "goal.com",
-                        "whoscored.com",
-                        "sofascore.com",
-                        "flashscore.com",
-                    ]
-                    
-                    for source in additional_sources[:5]:  # Try up to 5 sources
-                        print(f"[RAG] Searching {source} for key moments...")
-                        retry_results = _search_with_source(match_query, source, max_results=8)
-                        
-                        if retry_results:
-                            # Add to context and re-extract
-                            retry_context = "\n\n".join([f"{r.get('title', '')}\n{r.get('snippet', '')}" for r in retry_results])
-                            combined_context = context + "\n\n" + retry_context
-                            
-                            # Try to extract key moments from retry results
-                            retry_metadata = _extract_match_metadata(combined_context, original_query, client)
-                            
-                            # Update key moments if we got better data
-                            retry_moments = retry_metadata.get('key_moments', [])
-                            if retry_moments:
-                                # Check if new moments have actual player names
-                                better_moments = [
-                                    m for m in retry_moments 
-                                    if 'unknown player' not in m.get('description', '').lower() and
-                                       'player name' not in m.get('description', '').lower()
-                                ]
-                                if better_moments:
-                                    print(f"[RAG] ✓ Found {len(better_moments)} key moments with player names from {source}")
-                                    # Merge: keep existing moments, replace ones with unknown players
-                                    existing_moments = {m.get('minute', ''): m for m in key_moments}
-                                    for new_moment in better_moments:
-                                        minute = new_moment.get('minute', '')
-                                        if minute in existing_moments:
-                                            # Replace if new one has player name
-                                            if 'unknown player' in existing_moments[minute].get('description', '').lower():
-                                                existing_moments[minute] = new_moment
-                                        else:
-                                            existing_moments[minute] = new_moment
-                                    match_metadata['key_moments'] = list(existing_moments.values())
-                                    break
-
-                    # If still unknown players remain, run targeted minute-level searches (general web)
-                    unknown_moments = [
-                        m for m in match_metadata.get('key_moments', [])
-                        if 'unknown player' in m.get('description', '').lower() or
-                           'player name' in m.get('description', '').lower()
-                    ]
-                    if unknown_moments:
-                        print(f"[RAG] Still have unknown players; running targeted minute-level searches")
-                        for moment in unknown_moments[:3]:
-                            minute = moment.get('minute', '')
-                            minute_clean = str(minute).replace("'", "")
-                            focused_query = f"{home_team} vs {away_team} {match_date} {minute_clean} goal scorer men -women -wsl -femenil -feminine"
-                            print(f"[RAG] Targeted search for minute {minute_clean} scorer...")
-                            retry_results = _search_with_source(focused_query, None, max_results=8)
-                            if retry_results:
-                                retry_context = "\n\n".join([f"{r.get('title', '')}\n{r.get('snippet', '')}" for r in retry_results])
-                                combined_context = context + "\n\n" + retry_context
-                                
-                                retry_metadata = _extract_match_metadata(combined_context, original_query, client)
-                                
-                                # Only accept if teams (and date if available) match the original match
-                                retry_home = (retry_metadata.get('home_team') or '').lower()
-                                retry_away = (retry_metadata.get('away_team') or '').lower()
-                                orig_home = home_team.lower()
-                                orig_away = away_team.lower()
-                                teams_match = retry_home == orig_home and retry_away == orig_away
-                                date_match_ok = True
-                                if match_date and retry_metadata.get('match_date'):
-                                    date_match_ok = retry_metadata.get('match_date') == match_date
-                                
-                                retry_moments = retry_metadata.get('key_moments', []) if teams_match and date_match_ok else []
-                                
-                                better_moments = [
-                                    m for m in retry_moments 
-                                    if 'unknown player' not in m.get('description', '').lower() and
-                                       'player name' not in m.get('description', '').lower()
-                                ]
-                                if better_moments:
-                                    print(f"[RAG] ✓ Found player names for minute {minute_clean}")
-                                    existing_moments = {m.get('minute', ''): m for m in match_metadata.get('key_moments', [])}
-                                    for new_moment in better_moments:
-                                        minute_key = new_moment.get('minute', '')
-                                        existing_moments[minute_key] = new_moment
-                                    match_metadata['key_moments'] = list(existing_moments.values())
-                                    break
-            
-            # If no score found, try searching additional sources dynamically
-            if not match_metadata.get('score') and (match_metadata.get('home_team') or match_metadata.get('away_team')):
-                print(f"[RAG] No score found in initial search, trying additional sources...")
-                
-                home_team = match_metadata.get('home_team', '')
-                away_team = match_metadata.get('away_team', '')
-                match_date = match_metadata.get('match_date', '')
-                
-                if home_team and away_team:
-                    # Build match query
-                    match_query = f"{home_team} vs {away_team}"
-                    if match_date:
-                        match_query += f" {match_date}"
-                    match_query += " score result"
-                    
-                    # Try additional sources (max 4 tries total including initial)
-                    additional_sources = [
-                        "espn.com",
-                        "bbc.com/sport",
-                        "skysports.com",
-                        "theguardian.com/football",
-                        "goal.com",
-                        "flashscore.com",
-                    ]
-                    
-                    for source in additional_sources[:3]:  # Try 3 more sources
-                        print(f"[RAG] Retrying search for score: {source}...")
-                        retry_results = _search_with_source(match_query, source, max_results=5)
-                        
-                        if retry_results:
-                            # Add to context and re-extract
-                            retry_context = "\n\n".join([f"{r.get('title', '')}\n{r.get('snippet', '')}" for r in retry_results])
-                            combined_context = context + "\n\n" + retry_context
-                            
-                            # Try to extract score from retry results
-                            retry_metadata = _extract_match_metadata(combined_context, original_query, client)
-                            
-                            if retry_metadata.get('score'):
-                                print(f"[RAG] ✓ Found score in {source}: {retry_metadata.get('score')}")
-                                match_metadata['score'] = retry_metadata.get('score')
-                                # Also update other fields if they're missing
-                                if not match_metadata.get('match_date') and retry_metadata.get('match_date'):
-                                    match_metadata['match_date'] = retry_metadata.get('match_date')
-                                if not match_metadata.get('key_moments') and retry_metadata.get('key_moments'):
-                                    match_metadata['key_moments'] = retry_metadata.get('key_moments')
-                                break
-                    
-                    if not match_metadata.get('score'):
-                        print(f"[RAG] ⚠️ Score not found after searching multiple sources")
-                        # Update answer to reflect that score was not found
-                        if "score" in original_query.lower() or "result" in original_query.lower():
-                            answer = f"I searched multiple sources (ESPN, BBC, Sky Sports, The Guardian) but could not find the score for {home_team} vs {away_team}. " + answer
-            
-            # If no date was found but we have teams, try to extract date from search results
-            if not match_metadata.get('match_date') and (match_metadata.get('home_team') or match_metadata.get('away_team')):
-                extracted_date = _extract_date_from_context(context, original_query)
-                if extracted_date:
-                    match_metadata['match_date'] = extracted_date
-                    print(f"[RAG] Extracted date from search results: {extracted_date}")
-        
-        return answer, match_metadata
-        
+        answer_text = resp.choices[0].message.content.strip()
+        print("[RAG] Step 4: generated summary")
     except Exception as e:
-        print(f"[RAG] Generation error: {e}")
-        return _format_raw_results(all_results), match_metadata
+        print(f"[RAG] LLM error during summary: {e}")
+        answer_text = _format_raw_results(all_results)
+
+    # Deterministic metadata from the same context
+    metadata = _build_match_metadata_from_context(context, original_query, parsed_query)
+
+    # Append a compact source list
+    srcs = {c.get("source", "") for c in relevant_chunks if c.get("source")}
+    if srcs:
+        answer_text += "\n\n📚 Sources:"
+        for s in list(srcs)[:3]:
+            answer_text += f"\n  • {s}"
+
+    return answer_text, metadata
+
+
+# -----------------------------------------------------------------------------
+# Simple wrappers for compatibility
+# -----------------------------------------------------------------------------
+def _format_raw_results(results: List[dict]) -> str:
+    if not results:
+        return "No search results found."
+    lines = ["🔍 Search results:\n"]
+    for i, r in enumerate(results[:5], 1):
+        lines.append(f"{i}. {r.get('title','Untitled')}")
+        lines.append(f"   {r.get('snippet','')[:200]}...")
+        if r.get("url"):
+            lines.append(f"   🔗 {r['url']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def search_and_summarize_with_intent(
+    search_query: str,
+    intent: str,
+    summary_focus: str,
+    original_query: str,
+    parsed_query: Optional[dict] = None,
+) -> tuple[str, dict]:
+    """
+    Backwards-compatible wrapper that just calls search_with_rag.
+    """
+    return search_with_rag(search_query, intent, original_query, parsed_query)
+
+
+def search_and_summarize(query: str, use_llm: bool = True) -> str:
+    """
+    Simple wrapper if something still calls the old API.
+    Assumes match_result intent.
+    """
+    answer, _ = search_with_rag(query, intent="match_result", original_query=query, parsed_query=None)
+    return answer

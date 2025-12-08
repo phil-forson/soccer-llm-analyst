@@ -1952,7 +1952,7 @@ def _search_youtube_api_highlights(query: str, max_results: int = MAX_RESULTS, m
         # Preserve a last-resort candidate (first result from general search)
         last_resort_candidate = items[:1] if items else []
 
-        # Helper: run focused channel searches sequentially until one returns items
+        # Helper: run focused channel searches sequentially
         def _run_channel_focus() -> list:
             if not known_channel_ids:
                 return []
@@ -1995,25 +1995,22 @@ def _search_youtube_api_highlights(query: str, max_results: int = MAX_RESULTS, m
                 print("[YouTubeAPI] Focused channel searches returned 0 items")
             return channel_results_local
 
-        # If none of the top results are from known official channels OR we have no items, try focused channel searches
+        # Always run focused channel searches when we know trusted channels,
+        # then merge them ahead of general results to prioritize official sources.
+        channel_results: list = []
         if known_channel_ids:
-            need_focus = False
-            if items:
-                items_with_official = [
-                    it for it in items
-                    if (it.get("snippet", {}) or {}).get("channelId") in known_channel_ids
-                ]
-                need_focus = not items_with_official
-                if need_focus:
-                    print("[YouTubeAPI] No official channels in top results; will run channel-focused searches")
-            else:
-                need_focus = True
-                print("[YouTubeAPI] No items yet; will run channel-focused searches before fallbacks")
-
-            if need_focus:
-                channel_results = _run_channel_focus()
-                if channel_results:
-                    items = channel_results
+            channel_results = _run_channel_focus()
+            if channel_results:
+                merged_items = []
+                seen_vids: set[str] = set()
+                for candidate in channel_results + items:
+                    vid = (candidate.get("id") or {}).get("videoId") or candidate.get("id")
+                    if vid and vid in seen_vids:
+                        continue
+                    if vid:
+                        seen_vids.add(vid)
+                    merged_items.append(candidate)
+                items = merged_items
         
         # Fallback 1: widen search if nothing found (remove date window, any duration, relevance order)
         if not items:
@@ -3556,7 +3553,12 @@ def search_and_display_highlights_with_metadata(
         results = _search_youtube_highlights(
             query,
             max_results=10,  # Get first 10 from each query
-            match_info={"home_team": home_team, "away_team": away_team, "date": match_date}
+            match_info={
+                "home_team": home_team,
+                "away_team": away_team,
+                "date": match_date,
+                "competition": match_metadata.get("competition") if match_metadata else None,
+            }
         )
         for r in results:
             url = r.get("url", "")
