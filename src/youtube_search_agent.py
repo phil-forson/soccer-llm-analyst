@@ -1,10 +1,8 @@
 """
 YouTube search agent for finding match highlights.
 
-Uses YouTube Data API with DDG fallback. Features:
-- Competition-aware channel prioritization
-- Semantic similarity ranking for video relevance
-- Strict team name filtering
+Uses YouTube Data API with DDG fallback.
+Ranks videos by semantic similarity to the search query.
 """
 
 import logging
@@ -15,8 +13,6 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-
-from .utils import normalize_team_name
 
 
 # =============================================================================
@@ -29,9 +25,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 if not YOUTUBE_API_KEY:
     logger.warning("YOUTUBE_API_KEY is not set. YouTube search will fail.")
 
-AGENT_VERSION = "youtube_search_agent_v8_similarity_2025-12-09"
-
-# Preferred channels by competition
+# Preferred channels by competition (used for search order, not ranking)
 COMPETITION_CHANNEL_HINTS = {
     "premier league": [
         "UCqZQlzSHbVJrwrn5XvzrzcA",  # NBC Sports
@@ -49,10 +43,6 @@ GLOBAL_PREFERRED_CHANNEL_IDS = [
     "UC6c1z7bA__85CIWZ_jpCK-Q",  # ESPN
     "UCqZQlzSHbVJrwrn5XvzrzcA",  # NBC Sports
     "UCET00YnetHT7tOpu12v8jxg",  # CBS Sports
-]
-
-PREFERRED_BROADCASTERS = [
-    "nbcsports", "nbc sports", "espn", "espnfc", "cbs sports", "golazo"
 ]
 
 # Optional sentence-transformers for semantic similarity
@@ -114,24 +104,6 @@ def _build_context_text(match_context: Optional[Union[str, Dict, List]]) -> str:
     if isinstance(match_context, list):
         return "\n".join(str(x) for x in match_context)
     return str(match_context)
-
-
-def _extract_score_from_context(context_text: str) -> Optional[str]:
-    """Extract score pattern from context."""
-    if not context_text:
-        return None
-    matches = re.findall(r"\b\d+[-–:]\d+\b", context_text)
-    return matches[0].lower() if matches else None
-
-
-def _parse_publish_time(item: Dict[str, Any]) -> Optional[datetime]:
-    """Parse video publish time."""
-    ts = (
-        item.get("publish_time")
-        or item.get("publishTime")
-        or item.get("raw", {}).get("snippet", {}).get("publishedAt")
-    )
-    return _safe_parse_date(ts) if ts else None
 
 
 def _normalise_competition(comp: Optional[str]) -> Optional[str]:
@@ -240,109 +212,32 @@ def _compute_video_similarity_scores(
 
 
 # =============================================================================
-# Filtering & Combined Ranking
+# Similarity Ranking
 # =============================================================================
 
-def _candidate_has_teams(
-    item: Dict[str, Any],
-    home_team: Optional[str],
-    away_team: Optional[str],
-) -> bool:
-    """Check if candidate mentions both teams."""
-    title = (item.get("title") or "").lower()
-    desc = (item.get("description") or "").lower()
-    text = f"{title} {desc}"
-
-    h = normalize_team_name(home_team)
-    a = normalize_team_name(away_team)
-
-    if h and a:
-        return h in text and a in text
-    if h:
-        return h in text
-    return True
-
-
-def _rank_videos_by_similarity_and_heuristics(
+def _rank_videos_by_similarity(
     query: str,
     match_context: str,
     candidates: List[Dict[str, Any]],
-    home_team: Optional[str],
-    away_team: Optional[str],
-    match_date: Optional[Union[str, datetime]] = None,
     max_results: int = 5,
 ) -> List[Dict[str, Any]]:
     """
-    Rank videos using semantic similarity + heuristics.
+    Rank videos using pure semantic similarity.
     
-    Combines:
-    - Semantic similarity (how well video matches query/context)
-    - Team name presence
-    - Publication date proximity
-    - Broadcaster preference
+    Uses sentence-transformers to compute cosine similarity between
+    the query/context and video titles/descriptions.
     """
     if not candidates:
         return []
     
-    # Hard filter by team names first
-    filtered = [c for c in candidates if _candidate_has_teams(c, home_team, away_team)]
-    if not filtered:
-        logger.warning("No candidates contained both team names.")
-        return []
-    
     # Get semantic similarity scores
-    similarity_scored = _compute_video_similarity_scores(query, match_context, filtered)
+    similarity_scored = _compute_video_similarity_scores(query, match_context, candidates)
     
-    dt = _safe_parse_date(match_date)
-    score_token = _extract_score_from_context(match_context)
-    
-    # Apply heuristic adjustments
-    final_scored: List[Tuple[float, Dict[str, Any]]] = []
-    
-    for sim_score, item in similarity_scored:
-        title = (item.get("title") or "").lower()
-        score = sim_score  # Start with similarity (0-1)
-        
-        # Boost for highlight keywords
-        if any(kw in title for kw in ["highlight", "highlights", "extended", "goals"]):
-            score += 0.15
-        
-        # Boost for publication date proximity
-        pub_dt = _parse_publish_time(item)
-        if dt and pub_dt:
-            days_diff = abs((pub_dt.date() - dt.date()).days)
-            if days_diff <= 2:
-                score += 0.2
-            elif days_diff <= 7:
-                score += 0.1
-            else:
-                score -= 0.1
-        
-        # Boost if video title contains score from context
-        if score_token:
-            t_compact = title.replace(" ", "").replace("–", "-")
-            s_compact = score_token.replace(" ", "").replace("–", "-")
-            if s_compact in t_compact:
-                score += 0.15
-        
-        # Boost for preferred broadcasters
-        chan = (item.get("channel_title") or item.get("channelTitle") or "").lower()
-        desc = (item.get("description") or "").lower()
-        url = (item.get("url") or "").lower()
-        composite = f"{chan} {desc} {url}"
-        if any(b in composite for b in PREFERRED_BROADCASTERS):
-            score += 0.2
-        
-        final_scored.append((score, item))
-    
-    # Sort by final score
-    final_scored.sort(key=lambda x: x[0], reverse=True)
-    
-    logger.info(f"[Ranking] Final video ranking (similarity + heuristics):")
-    for i, (score, v) in enumerate(final_scored[:5]):
+    logger.info(f"[Ranking] Ranked {len(candidates)} videos by semantic similarity")
+    for i, (score, v) in enumerate(similarity_scored[:5]):
         logger.info(f"  {i+1}. Score: {score:.3f} | {v.get('title', '')[:60]}")
     
-    return [item for _, item in final_scored[:max_results]]
+    return [item for _, item in similarity_scored[:max_results]]
 
 
 # =============================================================================
@@ -602,13 +497,10 @@ def search_and_display_highlights_with_metadata(
             )
             if channel_items:
                 # Rank with similarity
-                validated = _rank_videos_by_similarity_and_heuristics(
+                validated = _rank_videos_by_similarity(
                     query=search_query,
                     match_context=context_text,
                 candidates=channel_items,
-                home_team=home_team,
-                away_team=away_team,
-                match_date=match_date,
                 max_results=max_results,
             )
             if validated:
@@ -623,13 +515,10 @@ def search_and_display_highlights_with_metadata(
                 max_results=max_results * 2,
             )
             if global_items:
-                candidates = _rank_videos_by_similarity_and_heuristics(
+                candidates = _rank_videos_by_similarity(
                     query=search_query,
                     match_context=context_text,
                     candidates=global_items,
-                    home_team=home_team,
-                    away_team=away_team,
-                    match_date=match_date,
                     max_results=max_results,
                 )
 
@@ -644,13 +533,10 @@ def search_and_display_highlights_with_metadata(
             max_results=max_results * 2,
         )
         if ddg_candidates:
-            candidates = _rank_videos_by_similarity_and_heuristics(
+            candidates = _rank_videos_by_similarity(
                 query=search_query,
                 match_context=context_text,
                 candidates=ddg_candidates,
-                home_team=home_team,
-                away_team=away_team,
-                match_date=match_date,
                 max_results=max_results,
             )
 
