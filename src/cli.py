@@ -6,6 +6,7 @@ Uses a smart query parser to understand intent and route appropriately.
 """
 
 import sys
+from datetime import datetime
 
 from .query_parser_agent import parse_query, should_fetch_highlights, QueryIntent
 from .web_search_agent import search_with_rag
@@ -18,14 +19,13 @@ from .youtube_search_agent import search_and_display_highlights_with_metadata
 
 def print_banner():
     """Print the welcome banner."""
-    banner = """
+    print("""
 ╔══════════════════════════════════════════════════════════════╗
 ║           ⚽ Soccer LLM Analyst (Smart Search) ⚽             ║
 ║                                                              ║
 ║  Ask anything about football - results, lineups, news, etc. ║
 ╚══════════════════════════════════════════════════════════════╝
-"""
-    print(banner)
+""")
 
 
 def print_divider():
@@ -34,15 +34,7 @@ def print_divider():
 
 
 def format_match_summary(match_metadata: dict) -> str:
-    """
-    Format match metadata into a nice summary with key moments.
-    
-    Args:
-        match_metadata: Dict with home_team, away_team, score, key_moments, etc.
-        
-    Returns:
-        Formatted string for display.
-    """
+    """Format match metadata into a nice summary with key moments."""
     if not match_metadata:
         return ""
     
@@ -56,80 +48,63 @@ def format_match_summary(match_metadata: dict) -> str:
     
     lines = []
     
-    # Header with score
     lines.append("")
     lines.append("╔" + "═" * 58 + "╗")
     lines.append(f"║  📊 MATCH SUMMARY{' ' * 40}║")
     lines.append("╠" + "═" * 58 + "╣")
     
-    # Score line
     score_line = f"║  {home} {score} {away}"
-    score_line += " " * (59 - len(score_line)) + "║"
+    score_line += " " * max(0, 59 - len(score_line)) + "║"
     lines.append(score_line)
     
     if match_date:
         date_line = f"║  📅 {match_date}"
-        date_line += " " * (59 - len(date_line)) + "║"
+        date_line += " " * max(0, 59 - len(date_line)) + "║"
         lines.append(date_line)
     
     lines.append("╠" + "═" * 58 + "╣")
     
-    # Key moments
     if key_moments:
         lines.append(f"║  ⚡ KEY MOMENTS{' ' * 42}║")
         lines.append("║" + " " * 58 + "║")
         
-        # Event emojis
         event_emojis = {
-            "GOAL": "⚽",
-            "goal": "⚽",
-            "RED_CARD": "🟥",
-            "red_card": "🟥",
-            "YELLOW_CARD": "🟨",
-            "yellow_card": "🟨",
-            "PENALTY": "🎯",
-            "penalty": "🎯",
-            "OWN_GOAL": "😬",
-            "own_goal": "😬",
-            "VAR": "📺",
-            "var": "📺",
-            "SAVE": "🧤",
-            "save": "🧤",
-            "SUBSTITUTION": "🔄",
-            "substitution": "🔄",
+            "GOAL": "⚽", "goal": "⚽",
+            "RED_CARD": "🟥", "red_card": "🟥",
+            "YELLOW_CARD": "🟨", "yellow_card": "🟨",
+            "PENALTY": "🎯", "penalty": "🎯",
+            "OWN_GOAL": "😬", "own_goal": "😬",
+            "VAR": "📺", "var": "📺",
+            "SAVE": "🧤", "save": "🧤",
+            "SUBSTITUTION": "🔄", "substitution": "🔄",
         }
         
-        for moment in key_moments[:6]:  # Limit to 6 key moments
+        for moment in key_moments[:6]:
             minute = moment.get("minute", "?")
             event = moment.get("event", "EVENT")
             desc = moment.get("description", "")
             
             emoji = event_emojis.get(event, "📌")
-            
-            # Format: "⚽ 45' - Haaland scores for Man City"
             moment_text = f"{emoji} {minute}' - {desc}"
             if len(moment_text) > 54:
                 moment_text = moment_text[:51] + "..."
             
             moment_line = f"║  {moment_text}"
-            moment_line += " " * (59 - len(moment_line)) + "║"
+            moment_line += " " * max(0, 59 - len(moment_line)) + "║"
             lines.append(moment_line)
         
         lines.append("║" + " " * 58 + "║")
     
-    # Man of the match
     if man_of_match:
         lines.append("╠" + "═" * 58 + "╣")
         motm_line = f"║  🌟 Man of the Match: {man_of_match}"
-        motm_line += " " * (59 - len(motm_line)) + "║"
+        motm_line += " " * max(0, 59 - len(motm_line)) + "║"
         lines.append(motm_line)
     
-    # Match summary
     if match_summary:
         lines.append("╠" + "═" * 58 + "╣")
         lines.append(f"║  📝 SUMMARY{' ' * 46}║")
         
-        # Word wrap the summary
         words = match_summary.split()
         current_line = ""
         for word in words:
@@ -137,12 +112,12 @@ def format_match_summary(match_metadata: dict) -> str:
                 current_line += (" " if current_line else "") + word
             else:
                 sum_line = f"║  {current_line}"
-                sum_line += " " * (59 - len(sum_line)) + "║"
+                sum_line += " " * max(0, 59 - len(sum_line)) + "║"
                 lines.append(sum_line)
                 current_line = word
         if current_line:
             sum_line = f"║  {current_line}"
-            sum_line += " " * (59 - len(sum_line)) + "║"
+            sum_line += " " * max(0, 59 - len(sum_line)) + "║"
             lines.append(sum_line)
     
     lines.append("╚" + "═" * 58 + "╝")
@@ -160,24 +135,18 @@ def handle_query(query: str):
     Handle a user query with smart intent detection.
     
     The flow is:
-    1. Parse the query to understand intent (what user wants)
+    1. Parse the query to understand intent
     2. Search the web for relevant information
-    3. Summarize based on intent (focus on what matters)
-    4. Only show highlights if appropriate (match results, not lineups)
-    
-    Args:
-        query: The user's natural language query.
+    3. Summarize based on intent
+    4. Only show highlights if appropriate
     """
-    # Step 1: Parse the query to understand intent
     print("\n🧠 Understanding your query...\n")
     parsed = parse_query(query)
     
     intent = parsed.get("intent", "general")
     search_query = parsed.get("search_query", query)
-    summary_focus = parsed.get("summary_focus", "key information")
     show_highlights = should_fetch_highlights(parsed)
     
-    # Display what we understood
     intent_emoji = {
         QueryIntent.MATCH_RESULT: "🏆",
         QueryIntent.MATCH_HIGHLIGHTS: "🎬",
@@ -201,14 +170,11 @@ def handle_query(query: str):
     if parsed.get("competition"):
         print(f"   Competition: {parsed['competition']}")
     
-    # Step 2: Search the web for relevant information
     print("\n🌐 Searching for information...\n")
     
-    # Add "latest" or current month to search if no specific date mentioned
     enhanced_search_query = search_query
     if intent in ["match_result", "match_highlights"] and not parsed.get("date_context"):
-        from datetime import datetime
-        current_month = datetime.now().strftime("%B %Y")  # e.g., "December 2025"
+        current_month = datetime.now().strftime("%B %Y")
         enhanced_search_query = f"{search_query} {current_month}"
     
     match_metadata = {}
@@ -220,12 +186,11 @@ def handle_query(query: str):
             original_query=query,
             parsed_query=parsed
         )
-        web_summary = result  # Store the summary for RAG validation
+        web_summary = result
         print("─" * 50)
         print(result)
         print("─" * 50)
         
-        # Display formatted match summary with key moments (for match results)
         if intent in ["match_result", "match_highlights"] and match_metadata.get("score"):
             summary_display = format_match_summary(match_metadata)
             if summary_display:
@@ -235,28 +200,36 @@ def handle_query(query: str):
         print(f"❌ Error searching the web: {e}")
         return
     
-    # Step 3: Show highlights ONLY if appropriate
     if show_highlights:
         print("\n🎬 Finding match highlights (with RAG validation)...\n")
         try:
-            # Use match metadata from web search for precise YouTube search
             home_team = match_metadata.get("home_team") or (parsed.get("teams", [None])[0])
             away_team = match_metadata.get("away_team") or (parsed.get("teams", [None, None])[1] if len(parsed.get("teams", [])) > 1 else None)
             match_date = match_metadata.get("match_date")
             
-            # Pass web summary for RAG-based validation of YouTube videos
             highlights = search_and_display_highlights_with_metadata(
                 home_team=home_team,
                 away_team=away_team,
                 match_date=match_date,
-                web_summary=web_summary,  # For RAG validation
-                match_metadata=match_metadata  # Full metadata including score
+                web_summary=web_summary,
+                match_metadata=match_metadata
             )
-            print(highlights)
+            
+            if highlights:
+                print("\n🎬 HIGHLIGHTS:\n")
+                for i, video in enumerate(highlights[:5], 1):
+                    title = video.get("title", "Unknown")
+                    url = video.get("url", "")
+                    print(f"  {i}. {title}")
+                    if url:
+                        print(f"     🔗 {url}")
+                    print()
+            else:
+                print("No highlights found for this match.")
+                
         except Exception as e:
             print(f"❌ Error searching for highlights: {e}")
     else:
-        # Tell user why we're not showing highlights
         if intent == QueryIntent.LINEUP:
             print("\n💡 Tip: Lineup info doesn't need highlights. Ask about the match result to see highlights!")
         elif intent == QueryIntent.TRANSFER_NEWS:
@@ -292,7 +265,6 @@ def main():
         
         try:
             handle_query(query)
-                
         except KeyboardInterrupt:
             print("\n\n⚠️  Interrupted. Returning to main menu...")
             continue
@@ -303,10 +275,6 @@ def main():
     
     sys.exit(0)
 
-
-# =============================================================================
-# Entry Point
-# =============================================================================
 
 if __name__ == "__main__":
     main()
