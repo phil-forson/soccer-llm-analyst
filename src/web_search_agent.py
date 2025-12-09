@@ -4,11 +4,12 @@ Web search agent for finding football match information.
 - Uses DuckDuckGo (ddgs) for web search.
 - Fetches full HTML from trusted sources.
 - Uses semantic similarity to rank results.
-- Extracts match metadata deterministically.
+- LLM extracts answer and metadata in one call.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -17,7 +18,7 @@ from typing import Optional, Tuple, List, Dict, Any
 import requests
 from requests.exceptions import RequestException
 
-from .utils import get_openai_client, safe_lower, domain_from_url
+from .utils import get_openai_client, domain_from_url
 from .config import DEFAULT_LLM_MODEL
 
 # Optional BeautifulSoup
@@ -193,7 +194,7 @@ def _compute_similarity_scores(
     """
     if not results:
         return []
-    
+
     if not SIMILARITY_AVAILABLE:
         # Fallback: return results as-is with neutral scores
         return [(0.5, r) for r in results]
@@ -254,7 +255,7 @@ def _rank_by_similarity(
     """
     if not results:
         return []
-    
+
     # Get semantic similarity scores
     similarity_scored = _compute_similarity_scores(query, results)
     
@@ -263,290 +264,6 @@ def _rank_by_similarity(
         print(f"  {i+1}. Score: {score:.3f} | {r.get('title', 'No title')[:60]}")
     
     return [r for _, r in similarity_scored]
-
-
-# =============================================================================
-# Score/Date Extraction
-# =============================================================================
-
-def _extract_score_from_context(
-    context: str, home_team: Optional[str], away_team: Optional[str]
-) -> Optional[str]:
-    """Deterministically extract a score 'X-Y' from context."""
-    if not context:
-        return None
-
-    text = context.lower().replace("–", "-")
-    home = (home_team or "").lower()
-    away = (away_team or "").lower()
-
-    score_hits: Dict[str, Dict[str, int]] = {}
-
-    for match in re.finditer(r"(\d{1,2})\s*-\s*(\d{1,2})", text):
-        left, right = int(match.group(1)), int(match.group(2))
-        if left > 15 or right > 15:
-            continue
-
-        score = f"{left}-{right}"
-        window_start = max(0, match.start() - 80)
-        window_end = min(len(text), match.end() + 80)
-        window = text[window_start:window_end]
-
-        priority = 0
-        if home and away and home in window and away in window:
-            priority = 2
-        elif (home and home in window) or (away and away in window):
-            priority = 1
-
-        hit = score_hits.get(score, {"count": 0, "priority": 0})
-        hit["count"] += 1
-        hit["priority"] = max(hit["priority"], priority)
-        score_hits[score] = hit
-
-    if not score_hits:
-        return None
-
-    best_score, best_meta = sorted(
-        score_hits.items(),
-        key=lambda item: (item[1]["priority"], item[1]["count"]),
-        reverse=True,
-    )[0]
-
-    if (home or away) and best_meta["priority"] == 0:
-        return None
-
-    return best_score
-
-
-def _extract_date_from_context(context: str, query: str) -> Optional[str]:
-    """Extract a date from the context in YYYY-MM-DD format."""
-    if not context:
-        return None
-
-    try:
-        patterns = [
-            r"(\d{4}-\d{2}-\d{2})",
-            r"(\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})",
-            r"((January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})",
-        ]
-
-        candidates: List[Tuple[datetime, str]] = []
-
-        for pattern in patterns:
-            for match in re.findall(pattern, context, re.IGNORECASE):
-                raw = match[0] if isinstance(match, tuple) else match
-                raw = raw.strip()
-                try:
-                    if re.match(r"\d{4}-\d{2}-\d{2}$", raw):
-                        dt = datetime.strptime(raw, "%Y-%m-%d")
-                    else:
-                        dt = None
-                        for fmt in ("%d %B %Y", "%B %d %Y", "%B %d, %Y"):
-                            try:
-                                dt = datetime.strptime(raw, fmt)
-                                break
-                            except ValueError:
-                                continue
-                        if dt is None:
-                            continue
-                    candidates.append((dt, raw))
-                except Exception:
-                    continue
-
-        if candidates:
-            today = datetime.now()
-            past = [(dt, raw) for dt, raw in candidates if dt <= today]
-            if past:
-                past.sort(key=lambda x: x[0], reverse=True)
-                return past[0][0].strftime("%Y-%m-%d")
-
-        if "yesterday" in safe_lower(query) or "yesterday" in safe_lower(context):
-            return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    except Exception:
-        pass
-
-    return None
-
-
-# =============================================================================
-# Team Order Correction
-# =============================================================================
-
-def _resolve_expected_teams(parsed_query: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
-    """Extract expected home/away teams from parsed query."""
-    if not parsed_query:
-        return None, None
-
-    teams = parsed_query.get("teams") or []
-    home_team = teams[0] if len(teams) >= 1 else None
-    away_team = teams[1] if len(teams) >= 2 else None
-    return home_team, away_team
-
-
-def _maybe_correct_team_order_with_score(
-    context: str,
-    score: Optional[str],
-    home_team: Optional[str],
-    away_team: Optional[str],
-) -> Tuple[Optional[str], Optional[str]]:
-    """Correct team order if context shows reversed order."""
-    if not (context and score and home_team and away_team):
-        return home_team, away_team
-
-    text = context.lower().replace("–", "-")
-    h, a = home_team.lower(), away_team.lower()
-    s = score.replace("–", "-")
-
-    pattern_home_first = re.compile(
-        rf"{re.escape(h)}[^\d]{{0,20}}{re.escape(s)}[^\w]{{0,20}}{re.escape(a)}",
-        re.IGNORECASE,
-    )
-    pattern_away_first = re.compile(
-        rf"{re.escape(a)}[^\d]{{0,20}}{re.escape(s)}[^\w]{{0,20}}{re.escape(h)}",
-        re.IGNORECASE,
-    )
-
-    home_first = bool(pattern_home_first.search(text))
-    away_first = bool(pattern_away_first.search(text))
-
-    if away_first and not home_first:
-        return away_team, home_team
-
-    return home_team, away_team
-
-
-# =============================================================================
-# Goal Event Extraction
-# =============================================================================
-
-def _extract_goal_events_from_context(
-    context: str,
-    home_team: Optional[str],
-    away_team: Optional[str],
-    score: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Extract goal events as key moments from article text."""
-    if not context:
-        return []
-
-    text = context.replace("–", "-")
-    lower = text.lower()
-    home = (home_team or "").lower()
-    away = (away_team or "").lower()
-
-    expected_goals: Optional[int] = None
-    if score and "-" in score:
-        try:
-            left, right = score.split("-", 1)
-            expected_goals = int(left) + int(right)
-        except ValueError:
-            pass
-
-    goal_keywords = (
-        "goal", "scores", "scored", "nets", "netted",
-        "strike", "header", "penalty", "spot-kick",
-        "equaliser", "equalizer", "winner"
-    )
-
-    moments: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-
-    pat1 = re.compile(r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\s*\(\s*(\d{1,2})\s*(?:'|')?", re.MULTILINE)
-    pat2 = re.compile(r"(\d{1,2})(?:st|nd|rd|th)?-?\s*minute[^\.]{0,80}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", re.IGNORECASE | re.MULTILINE)
-    pat3 = re.compile(r"in the (\d{1,2})(?:st|nd|rd|th)? minute[^\.]{0,80}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)", re.IGNORECASE | re.MULTILINE)
-
-    def _infer_team_for_name(idx: int) -> Optional[str]:
-        window_start = max(0, idx - 140)
-        window_end = min(len(lower), idx + 140)
-        window = lower[window_start:window_end]
-
-        if not any(kw in window for kw in goal_keywords):
-            return None
-
-        has_home = bool(home and home in window)
-        has_away = bool(away and away in window)
-
-        if has_home and not has_away:
-            return home_team
-        if has_away and not has_home:
-            return away_team
-        return None
-
-    def _add_moment(minute: str, name: str, idx: int):
-        try:
-            m_int = int(minute)
-            if m_int <= 0 or m_int > 130:
-                return
-        except ValueError:
-            return
-
-        team = _infer_team_for_name(idx)
-        if not team:
-            return
-
-        minute_label = f"{minute}'"
-        key = (minute_label, name, team)
-        if key in moments:
-            return
-
-        description = f"GOAL for {team}: {name} scores in the {minute}th minute."
-        moments[key] = {
-            "minute": minute_label,
-            "event": "Goal",
-            "description": description,
-            "team": team,
-        }
-
-    for m in pat1.finditer(text):
-        _add_moment(m.group(2), m.group(1).strip(), m.start())
-    for m in pat2.finditer(text):
-        _add_moment(m.group(1), m.group(2).strip(), m.start())
-    for m in pat3.finditer(text):
-        _add_moment(m.group(1), m.group(2).strip(), m.start())
-
-    result = list(moments.values())
-    try:
-        result.sort(key=lambda x: int(re.sub(r"[^0-9]", "", x["minute"]) or 0))
-    except Exception:
-        pass
-
-    if expected_goals is not None and len(result) > expected_goals:
-        result = result[:expected_goals]
-
-    return result
-
-
-# =============================================================================
-# Metadata Building
-# =============================================================================
-
-def _build_match_metadata_from_context(
-    context: str, original_query: str, parsed_query: Optional[dict]
-) -> dict:
-    """Build match metadata deterministically from context."""
-    home_team, away_team = _resolve_expected_teams(parsed_query)
-
-    raw_score = _extract_score_from_context(context, home_team, away_team)
-    match_date = _extract_date_from_context(context, original_query)
-
-    home_team, away_team = _maybe_correct_team_order_with_score(
-        context=context, score=raw_score, home_team=home_team, away_team=away_team
-    )
-
-    key_moments = _extract_goal_events_from_context(
-        context, home_team, away_team=away_team, score=raw_score
-    )
-
-    return {
-        "home_team": home_team,
-        "away_team": away_team,
-        "match_date": match_date,
-        "score": raw_score,
-        "competition": parsed_query.get("competition") if parsed_query else None,
-        "key_moments": key_moments,
-        "man_of_the_match": None,
-        "match_summary": None,
-    }
 
 
 # =============================================================================
@@ -569,32 +286,6 @@ def _build_context_from_results(results: List[dict], k: int = 5) -> List[dict]:
         })
     
     return context_chunks
-
-
-# =============================================================================
-# LLM Summarization
-# =============================================================================
-
-def _get_intent_instructions(intent: str, summary_focus: Optional[str]) -> str:
-    """Get intent-specific instructions for LLM summarization."""
-    base = {
-        "match_result": """Focus on:
-- final score
-- goalscorers and timings
-- key moments (red cards, penalties)""",
-        "match_highlights": """Focus on:
-- score and result
-- highlight moments (goals, big chances, red cards)""",
-        "team_news": """Focus on:
-- latest news
-- injuries, manager comments
-- recent form""",
-        "transfer_news": """Focus on:
-- confirmed transfers and rumours
-- fees and contract details""",
-    }.get(intent, "Provide a concise, factual summary.")
-    
-    return base + f"\n\nUser focus: {summary_focus or 'key information'}."
 
 
 # =============================================================================
@@ -691,26 +382,37 @@ def search_with_rag(
         f"[Source: {c.get('title','Unknown')}]\n{c['text']}" for c in relevant_chunks
     )
 
-    # Step 5: LLM summary
+    # Step 5: LLM extracts answer AND metadata in one call
     client = get_openai_client()
-    intent_instructions = _get_intent_instructions(intent, summary_focus)
+    
+    system_prompt = """You are a football/soccer information assistant.
 
-    system_prompt = f"""You are a football/soccer information assistant.
-
-{intent_instructions}
+You must respond with valid JSON containing:
+{
+  "answer": "Your natural language answer to the user's question",
+  "score": "X-Y" or null if not found,
+  "home_team": "Team name" or null,
+  "away_team": "Team name" or null,
+  "match_date": "YYYY-MM-DD" or null,
+  "competition": "Competition name" or null,
+  "key_moments": [
+    {"minute": "45'", "event": "Goal", "description": "Player scored", "team": "Team name"}
+  ]
+}
 
 STRICT RULES:
 1. Only use information from the provided context.
-2. If a score is not present, say it was not found.
+2. If information is not found, use null.
 3. Do NOT guess or invent scores, dates, or player names.
-4. If unsure, say explicitly that information is not available."""
+4. The "answer" field should be a helpful, natural response to the user.
+5. Output ONLY valid JSON, no markdown or extra text."""
 
     user_message = f"""User question: {original_query}
 
 Context:
 {context}
 
-Based ONLY on the context above, answer the user's question."""
+Extract the answer and match metadata from the context above. Return JSON only."""
 
     try:
         resp = client.chat.completions.create(
@@ -719,17 +421,55 @@ Based ONLY on the context above, answer the user's question."""
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.2,
-            max_tokens=600,
+            temperature=0.1,
+            max_tokens=800,
         )
-        answer_text = resp.choices[0].message.content.strip()
+        raw_response = resp.choices[0].message.content.strip()
+        
+        # Clean up response (remove markdown code blocks if present)
+        if raw_response.startswith("```"):
+            raw_response = re.sub(r"^```(?:json)?\n?", "", raw_response)
+            raw_response = re.sub(r"\n?```$", "", raw_response)
+        
+        # Parse JSON
+        llm_data = json.loads(raw_response)
+        
+        answer_text = llm_data.get("answer", "")
+        metadata = {
+            "home_team": llm_data.get("home_team"),
+            "away_team": llm_data.get("away_team"),
+            "match_date": llm_data.get("match_date"),
+            "score": llm_data.get("score"),
+            "competition": llm_data.get("competition") or (parsed_query.get("competition") if parsed_query else None),
+            "key_moments": llm_data.get("key_moments", []),
+            "man_of_the_match": llm_data.get("man_of_the_match"),
+            "match_summary": llm_data.get("match_summary"),
+        }
+        
+        print(f"[WebSearch] LLM extracted - Score: {metadata.get('score')}, Teams: {metadata.get('home_team')} vs {metadata.get('away_team')}")
+        
+    except json.JSONDecodeError as e:
+        print(f"[WebSearch] JSON parse error: {e}")
+        print(f"[WebSearch] Raw response: {raw_response[:500]}")
+        # Fallback: use raw response as answer
+        answer_text = raw_response if raw_response else _format_raw_results(ranked_results)
+        metadata = {
+            "home_team": home_team, "away_team": away_team,
+            "match_date": None, "score": None,
+            "competition": parsed_query.get("competition") if parsed_query else None,
+            "key_moments": [], "man_of_the_match": None, "match_summary": None,
+        }
     except Exception as e:
         print(f"[WebSearch] LLM error: {e}")
         answer_text = _format_raw_results(ranked_results)
+        metadata = {
+            "home_team": home_team, "away_team": away_team,
+            "match_date": None, "score": None,
+            "competition": parsed_query.get("competition") if parsed_query else None,
+            "key_moments": [], "man_of_the_match": None, "match_summary": None,
+        }
     
-    # Build metadata from context
-    metadata = _build_match_metadata_from_context(context, original_query, parsed_query)
-    
+    # Determine if match was found
     if not (metadata.get("score") or metadata.get("match_date") or metadata.get("key_moments")):
         metadata["no_match_found"] = True
     else:

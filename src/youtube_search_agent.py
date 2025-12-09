@@ -378,6 +378,73 @@ def _parse_video_id_from_url(url: str) -> Optional[str]:
     return None
 
 
+# Preferred broadcasters by competition for DDG search
+COMPETITION_BROADCASTERS = {
+    "premier league": ["NBC Sports", "Sky Sports", "ESPN"],
+    "champions league": ["CBS Sports Golazo", "CBS Sports", "TNT Sports"],
+    "ucl": ["CBS Sports Golazo", "CBS Sports", "TNT Sports"],
+    "la liga": ["ESPN", "beIN Sports"],
+    "bundesliga": ["ESPN"],
+    "serie a": ["CBS Sports", "Paramount+"],
+    "ligue 1": ["beIN Sports"],
+    "fa cup": ["ESPN", "BBC Sport"],
+    "carabao cup": ["Sky Sports"],
+    "europa league": ["CBS Sports Golazo", "CBS Sports", "TNT Sports"],
+    "conference league": ["CBS Sports Golazo", "CBS Sports"],
+}
+
+# Broadcaster name patterns to detect from title/description
+BROADCASTER_PATTERNS = {
+    "golazo": "CBS Sports Golazo",
+    "cbs sports golazo": "CBS Sports Golazo",
+    "cbs golazo": "CBS Sports Golazo",
+    "nbc": "NBC Sports",
+    "nbcsports": "NBC Sports",
+    "sky sports": "Sky Sports",
+    "skysports": "Sky Sports",
+    "espn": "ESPN",
+    "espnfc": "ESPN",
+    "cbs sports": "CBS Sports",
+    "cbs": "CBS Sports",
+    "paramount": "CBS Sports",
+    "tnt sports": "TNT Sports",
+    "bt sport": "TNT Sports",
+    "bein": "beIN Sports",
+    "bbc": "BBC Sport",
+    "goal.com": "Goal",
+}
+
+
+def _infer_channel_from_text(title: str, description: str) -> str:
+    """Try to infer channel name from title or description."""
+    text = f"{title} {description}".lower()
+    
+    for pattern, channel_name in BROADCASTER_PATTERNS.items():
+        if pattern in text:
+            return channel_name
+    
+    return ""
+
+
+def _get_preferred_broadcasters(competition: Optional[str]) -> List[str]:
+    """Get preferred broadcasters for a competition."""
+    if not competition:
+        default = ["ESPN", "NBC Sports", "CBS Sports"]
+        print(f"[YouTube] No competition specified, using default broadcasters: {default}")
+        return default
+    
+    comp_lower = competition.lower()
+    
+    for comp_key, broadcasters in COMPETITION_BROADCASTERS.items():
+        if comp_key in comp_lower:
+            print(f"[YouTube] Competition '{competition}' matched '{comp_key}' → Broadcasters: {broadcasters}")
+            return broadcasters
+    
+    default = ["ESPN", "NBC Sports", "CBS Sports"]
+    print(f"[YouTube] Competition '{competition}' not found in config, using default: {default}")
+    return default
+
+
 def _ddg_search_highlights(
     home_team: str,
     away_team: str,
@@ -385,40 +452,84 @@ def _ddg_search_highlights(
     match_date: Optional[Union[str, datetime]] = None,
     max_results: int = 10,
 ) -> List[Dict[str, Any]]:
-    """Use DDG to find YouTube highlight links as fallback."""
+    """
+    Use DDG to find YouTube highlight links as fallback.
+    
+    Searches with competition-specific broadcaster names first,
+    then falls back to generic search.
+    """
+    print(f"\n{'='*60}")
+    print(f"[YouTube DDG Search]")
+    print(f"{'='*60}")
+    print(f"  Home: {home_team}")
+    print(f"  Away: {away_team}")
+    print(f"  Competition: {competition}")
+    print(f"  Date: {match_date}")
+    
     try:
         from ddgs import DDGS
     except ImportError:
-        logger.error("ddgs not installed. Cannot use DDG fallback.")
+        print("[YouTube] ERROR: ddgs not installed!")
         return []
 
     dt = _safe_parse_date(match_date)
     date_phrase = dt.strftime("%d %B %Y") if dt else ""
     comp_part = f" {competition}" if competition else ""
     
+    # Get preferred broadcasters for this competition
+    preferred_broadcasters = _get_preferred_broadcasters(competition)
+    
+    # Build queries: broadcaster-specific first, then generic
+    queries = []
+    
+    # Priority 1: Broadcaster-specific queries
+    for broadcaster in preferred_broadcasters[:2]:  # Top 2 broadcasters
+        q = f"{home_team} vs {away_team} highlights {broadcaster}"
+        if competition:
+            q += f" {competition}"
+        queries.append(q)
+    
+    # Priority 2: Generic queries
     base_q = f"{home_team} vs {away_team} highlights{comp_part}"
-    queries = [base_q]
+    queries.append(base_q)
+    
     if date_phrase:
         queries.append(f"{base_q} {date_phrase}")
 
+    print(f"\n[YouTube] Search queries (in priority order):")
+    for i, q in enumerate(queries, 1):
+        print(f"  {i}. \"{q}\"")
+
     raw_results: List[Dict[str, Any]] = []
+    seen_video_ids: set = set()
+    
     with DDGS() as ddgs:
         for q in queries:
+            print(f"\n[YouTube] Searching: \"{q}\"")
+            results_from_query = 0
+            
             for r in ddgs.text(q, max_results=max_results):
                 url = r.get("href", "") or ""
                 if "youtube.com" not in url:
                     continue
                 vid = _parse_video_id_from_url(url)
-                if not vid:
+                if not vid or vid in seen_video_ids:
                     continue
 
+                seen_video_ids.add(vid)
+                title = r.get("title", "") or ""
+                description = r.get("body", "") or ""
+                
+                # Try to infer channel from title/description
+                inferred_channel = _infer_channel_from_text(title, description)
+                
                 raw_results.append({
                         "video_id": vid,
                         "videoId": vid,
-                    "title": r.get("title", "") or "",
-                    "description": r.get("body", "") or "",
-                    "channel_title": "",
-                        "channelTitle": "",
+                        "title": title,
+                    "description": description,
+                    "channel_title": inferred_channel,
+                    "channelTitle": inferred_channel,
                         "publish_time": "",
                         "publishTime": "",
                         "url": url,
@@ -427,7 +538,21 @@ def _ddg_search_highlights(
                         "source_type": "ddg_fallback",
                         "search_query": q,
                 })
-    
+                results_from_query += 1
+                
+                print(f"    Found: {title[:60]}...")
+                if inferred_channel:
+                    print(f"           Channel (inferred): {inferred_channel}")
+            
+            print(f"  → {results_from_query} videos from this query")
+            
+            # If we have enough results from broadcaster-specific queries, stop
+            if len(raw_results) >= max_results:
+                print(f"\n[YouTube] Got {len(raw_results)} results, stopping search")
+            break
+
+    print(f"\n[YouTube] Total: {len(raw_results)} YouTube videos found")
+    print(f"{'='*60}\n")
     return raw_results
 
 
@@ -450,30 +575,38 @@ def search_and_display_highlights_with_metadata(
     1. Build search queries
     2. Try YouTube API (competition-aware channels)
     3. Fall back to DDG if needed
-    4. Rank by semantic similarity + heuristics
+    4. Rank by semantic similarity
     
     Returns list of video metadata dicts.
     """
+    print(f"\n{'='*60}")
+    print(f"[YouTube Highlights Search]")
+    print(f"{'='*60}")
+    
     # Extract competition
     competition = extra.get("competition")
     match_metadata = extra.get("match_metadata")
     if not competition and isinstance(match_metadata, dict):
         competition = match_metadata.get("competition")
 
-    logger.info(
-        "Searching highlights | home=%s | away=%s | date=%s | competition=%s",
-        home_team, away_team, match_date, competition
-    )
+    print(f"  Home Team: {home_team}")
+    print(f"  Away Team: {away_team}")
+    print(f"  Competition: {competition}")
+    print(f"  Match Date: {match_date}")
     
     # Build search query string for similarity matching
     search_query = f"{home_team} vs {away_team} highlights"
     if competition:
         search_query += f" {competition}"
     
+    print(f"  Similarity Query: \"{search_query}\"")
+    
     # Build context text for similarity matching
     context_text = _build_context_text(match_context or extra.get("web_summary") or match_metadata)
+    print(f"  Context Length: {len(context_text)} chars")
 
     queries = build_search_queries(home_team, away_team, match_date, competition)
+    print(f"\n[YouTube] Built {len(queries)} search queries")
 
     candidates: List[Dict[str, Any]] = []
     youtube = None
@@ -481,13 +614,17 @@ def search_and_display_highlights_with_metadata(
     # Try YouTube API
     try:
         youtube = _get_youtube_client()
+        print(f"[YouTube] API client initialized ✓")
     except Exception as e:
-        logger.error("YouTube client init failed: %s", e)
+        print(f"[YouTube] API client FAILED: {e}")
+        print(f"[YouTube] Will use DDG fallback")
 
     if youtube:
         channel_order = _preferred_channel_order(competition)
+        print(f"[YouTube API] Searching preferred channels: {channel_order}")
 
         for chan in channel_order:
+            print(f"[YouTube API] Searching channel: {chan}")
             channel_items = _search_on_channel(
                 youtube=youtube,
                 channel_id=chan,
@@ -496,18 +633,23 @@ def search_and_display_highlights_with_metadata(
                 max_results=max_results * 2,
             )
             if channel_items:
+                print(f"[YouTube API] Found {len(channel_items)} videos from channel {chan}")
                 # Rank with similarity
                 validated = _rank_videos_by_similarity(
                     query=search_query,
                     match_context=context_text,
-                candidates=channel_items,
-                max_results=max_results,
-            )
-            if validated:
-                candidates = validated
-                break
+                    candidates=channel_items,
+                    max_results=max_results,
+                )
+                if validated:
+                    candidates = validated
+                    print(f"[YouTube API] Using {len(candidates)} videos from preferred channel")
+                    break
+            else:
+                print(f"[YouTube API] No videos from channel {chan}")
 
         if not candidates:
+            print(f"[YouTube API] No results from preferred channels, trying global search...")
             global_items = _search_globally(
                 youtube=youtube,
                 queries=queries,
@@ -515,6 +657,7 @@ def search_and_display_highlights_with_metadata(
                 max_results=max_results * 2,
             )
             if global_items:
+                print(f"[YouTube API] Found {len(global_items)} videos globally")
                 candidates = _rank_videos_by_similarity(
                     query=search_query,
                     match_context=context_text,
@@ -524,7 +667,7 @@ def search_and_display_highlights_with_metadata(
 
     # DDG fallback
     if not candidates:
-        logger.info("Falling back to DDG search.")
+        print(f"\n[YouTube] No API results, falling back to DDG search...")
         ddg_candidates = _ddg_search_highlights(
             home_team=home_team,
             away_team=away_team,
@@ -533,6 +676,7 @@ def search_and_display_highlights_with_metadata(
             max_results=max_results * 2,
         )
         if ddg_candidates:
+            print(f"[YouTube DDG] Ranking {len(ddg_candidates)} videos by similarity...")
             candidates = _rank_videos_by_similarity(
                 query=search_query,
                 match_context=context_text,
@@ -540,5 +684,16 @@ def search_and_display_highlights_with_metadata(
                 max_results=max_results,
             )
 
-    logger.info("Final highlight count: %d", len(candidates))
+    # Final summary
+    print(f"\n{'='*60}")
+    print(f"[YouTube] FINAL RESULTS: {len(candidates)} highlights")
+    print(f"{'='*60}")
+    for i, v in enumerate(candidates[:5], 1):
+        title = v.get("title", "")[:55]
+        channel = v.get("channel_title") or v.get("channelTitle") or "Unknown"
+        source = v.get("source_type", "unknown")
+        print(f"  {i}. [{source}] {title}...")
+        print(f"     Channel: {channel}")
+    print(f"{'='*60}\n")
+
     return candidates
