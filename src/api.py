@@ -10,11 +10,13 @@ import asyncio
 import json
 import logging
 import re
+from collections import defaultdict, deque
+from time import monotonic
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from urllib.parse import unquote
 
 import uvicorn
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -35,6 +37,10 @@ from .game_analyst_agent import analyze_match_from_web_results
 # =============================================================================
 
 API_VERSION = "1.0.0"
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 10
+_rate_limit_log: Dict[str, deque] = defaultdict(deque)
+_rate_limit_lock = asyncio.Lock()
 
 
 # =============================================================================
@@ -91,6 +97,26 @@ def _format_sse_message(stage: str, message: str, status: str, data: Optional[Di
     _log_thinking(stage, message, status, data)
     msg = ThinkingMessage(stage=stage, message=message, status=status, data=data or {})
     return f"data: {msg.model_dump_json()}\n\n"
+
+
+async def _is_rate_limited(client_ip: str) -> bool:
+    """
+    Simple in-memory sliding window rate limiter.
+    Limits total requests per IP across endpoints.
+    """
+    now = monotonic()
+    window = RATE_LIMIT_WINDOW_SECONDS
+    max_requests = RATE_LIMIT_MAX_REQUESTS
+
+    async with _rate_limit_lock:
+        log = _rate_limit_log[client_ip]
+        # Drop entries outside the window
+        while log and now - log[0] > window:
+            log.popleft()
+        if len(log) >= max_requests:
+            return True
+        log.append(now)
+    return False
 
 
 def _normalise_highlight_results(raw: Any) -> List[HighlightVideo]:
@@ -426,6 +452,7 @@ async def health_check():
 @app.get("/query/stream")
 @app.post("/query/stream")
 async def query_stream_endpoint(
+    request_obj: Request,
     request: Optional[QueryRequest] = None,
     query: Optional[str] = Query(None, description="The query to process"),
     include_highlights: Optional[bool] = Query(None, description="Whether to include highlights")
@@ -436,6 +463,32 @@ async def query_stream_endpoint(
     Returns: Web search results + summary + highlights (if requested).
     For deep game analysis, use the /analyze endpoint separately.
     """
+    client_ip = request_obj.client.host if request_obj and request_obj.client else "unknown"
+    if await _is_rate_limited(client_ip):
+        error_response = {
+            "type": "result",
+            "data": {
+                "success": False,
+                "intent": "general",
+                "summary": "❌ Too many requests. Please slow down and try again.",
+                "error": "rate_limited",
+                "match_metadata": None,
+                "highlights": [],
+                "sources": [],
+                "game_analysis": None,
+            }
+        }
+        return StreamingResponse(
+            f"data: {json.dumps(error_response)}\n\ndata: [DONE]\n\n",
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8",
+            }
+        )
+
     if request is None:
         if query is None:
             error_response = {
@@ -538,13 +591,26 @@ async def query_stream_endpoint(
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query_endpoint(request: QueryRequest):
+async def query_endpoint(request: QueryRequest, request_obj: Request):
     """
     Main query endpoint - answers user questions.
     
     Returns: Web search results + summary + highlights.
     For deep game analysis, use the /analyze endpoint separately.
     """
+    client_ip = request_obj.client.host if request_obj and request_obj.client else "unknown"
+    if await _is_rate_limited(client_ip):
+        return QueryResponse(
+            success=False,
+            intent="general",
+            summary="❌ Too many requests. Please slow down and try again.",
+            error="rate_limited",
+            match_metadata=None,
+            highlights=[],
+            sources=[],
+            game_analysis=None,
+        )
+
     result = None
     async for item in _process_query_core(request, stream_thinking=False):
         if isinstance(item, dict):
@@ -594,7 +660,7 @@ async def list_intents():
 
 
 @app.post("/analyze", response_model=GameAnalysisResponse)
-async def analyze_match_endpoint(request: QueryRequest):
+async def analyze_match_endpoint(request: QueryRequest, request_obj: Request):
     """
     Deep game analysis endpoint - ONLY called on explicit request.
     
@@ -607,6 +673,13 @@ async def analyze_match_endpoint(request: QueryRequest):
     explicitly wants deep analysis.
     """
     try:
+        client_ip = request_obj.client.host if request_obj and request_obj.client else "unknown"
+        if await _is_rate_limited(client_ip):
+            return GameAnalysisResponse(
+                success=False,
+                error="Too many requests. Please slow down and try again."
+            )
+
         # Step 1: Parse query
         try:
             parsed = parse_query(
