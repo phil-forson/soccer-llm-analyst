@@ -167,6 +167,83 @@ def build_search_queries(
 
 
 # =============================================================================
+# Team Order Filtering
+# =============================================================================
+
+# Team name aliases/nicknames mapping
+TEAM_ALIASES = {
+    "tottenham": ["spurs", "tottenham hotspur", "tottenham fc"],
+    "tottenham hotspur": ["spurs", "tottenham", "tottenham fc"],
+    "manchester united": ["man united", "man u", "united", "manchester utd"],
+    "manchester city": ["man city", "city", "mancity"],
+    "arsenal": ["gunners", "arsenal fc"],
+    "liverpool": ["liverpool fc", "the reds"],
+    "chelsea": ["chelsea fc", "the blues"],
+    "manchester": ["man united", "man city"],  # Ambiguous, but try both
+}
+
+def _get_team_variations(team_name: str) -> List[str]:
+    """Get all variations/aliases for a team name."""
+    if not team_name:
+        return []
+    
+    team_lower = team_name.lower()
+    variations = [team_lower]
+    
+    # Add aliases if team is in mapping
+    if team_lower in TEAM_ALIASES:
+        variations.extend(TEAM_ALIASES[team_lower])
+    
+    # Also check if any alias maps to this team
+    for alias_team, aliases in TEAM_ALIASES.items():
+        if team_lower in aliases:
+            variations.append(alias_team)
+            variations.extend(aliases)
+    
+    return list(set(variations))  # Remove duplicates
+
+
+def _check_team_order_in_text(text: str, home_team: Optional[str], away_team: Optional[str]) -> bool:
+    """
+    Check if text contains teams in the expected order (home vs away).
+    
+    Returns True if home_team appears before away_team in the text.
+    Handles team name variations and aliases (e.g., "Tottenham" matches "Spurs", "Tottenham Hotspur").
+    """
+    if not home_team or not away_team:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Get all variations for both teams
+    home_variations = _get_team_variations(home_team)
+    away_variations = _get_team_variations(away_team)
+    
+    # Find positions for any variation of each team
+    home_pos = -1
+    away_pos = -1
+    
+    for variation in home_variations:
+        pos = text_lower.find(variation)
+        if pos != -1:
+            if home_pos == -1 or pos < home_pos:
+                home_pos = pos
+    
+    for variation in away_variations:
+        pos = text_lower.find(variation)
+        if pos != -1:
+            if away_pos == -1 or pos < away_pos:
+                away_pos = pos
+    
+    # Both teams must be present
+    if home_pos == -1 or away_pos == -1:
+        return False
+
+    # Home team should appear before away team
+    return home_pos < away_pos
+
+
+# =============================================================================
 # Semantic Similarity Ranking for Videos
 # =============================================================================
 
@@ -174,6 +251,9 @@ def _compute_video_similarity_scores(
     query: str,
     match_context: str,
     candidates: List[Dict[str, Any]],
+    home_team: Optional[str] = None,
+    away_team: Optional[str] = None,
+    emphasize_order: bool = False,
 ) -> List[Tuple[float, Dict[str, Any]]]:
     """
     Compute semantic similarity between query/context and video titles/descriptions.
@@ -209,6 +289,33 @@ def _compute_video_similarity_scores(
         video_norms = video_embeddings / np.linalg.norm(video_embeddings, axis=1, keepdims=True)
         similarities = np.dot(video_norms, ref_norm)
         
+        # Apply team order filtering if emphasize_order is True
+        if emphasize_order and home_team and away_team:
+            for i, (sim, v) in enumerate(zip(similarities, candidates)):
+                video_text = f"{v.get('title', '')} {v.get('description', '')[:300]}"
+                matches_order = _check_team_order_in_text(video_text, home_team, away_team)
+                text_lower = video_text.lower()
+                
+                # Check if both teams are present (using variations/aliases)
+                home_variations = _get_team_variations(home_team)
+                away_variations = _get_team_variations(away_team)
+                has_home = any(var in text_lower for var in home_variations)
+                has_away = any(var in text_lower for var in away_variations)
+                has_both_teams = has_home and has_away
+                
+                if matches_order:
+                    # Boost: videos matching team order get +0.2 boost
+                    old_score = similarities[i]
+                    similarities[i] = min(1.0, sim + 0.2)
+                    if i < 5:  # Log top 5 videos
+                        logger.info(f"[TeamOrder] Video {i+1}: '{v.get('title', '')[:50]}' - ORDER MATCH: {old_score:.3f} → {similarities[i]:.3f} (+0.2)")
+                elif has_both_teams:
+                    # Penalty: videos with teams in wrong order -0.25 penalty
+                    old_score = similarities[i]
+                    similarities[i] = max(0.1, sim - 0.25)
+                    if i < 5:  # Log top 5 videos
+                        logger.info(f"[TeamOrder] Video {i+1}: '{v.get('title', '')[:50]}' - WRONG ORDER: {old_score:.3f} → {similarities[i]:.3f} (-0.25)")
+        
         # Pair scores with videos
         scored = [(float(sim), v) for sim, v in zip(similarities, candidates)]
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -235,6 +342,9 @@ def _rank_videos_by_similarity(
     max_results: int = 5,
     min_similarity: float = 0.6,
     return_scores: bool = False,
+    home_team: Optional[str] = None,
+    away_team: Optional[str] = None,
+    emphasize_order: bool = False,
 ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], List[Tuple[float, Dict[str, Any]]]]]:
     """
     Rank videos using pure semantic similarity.
@@ -253,10 +363,17 @@ def _rank_videos_by_similarity(
     if not candidates:
         return [] if not return_scores else ([], [])
     
-    # Get semantic similarity scores
-    similarity_scored = _compute_video_similarity_scores(query, match_context, candidates)
+    # Get semantic similarity scores (with team order filtering if applicable)
+    similarity_scored = _compute_video_similarity_scores(
+        query, match_context, candidates,
+        home_team=home_team,
+        away_team=away_team,
+        emphasize_order=emphasize_order,
+    )
     
     logger.info(f"[Ranking] Ranked {len(candidates)} videos by semantic similarity")
+    if emphasize_order and home_team and away_team:
+        logger.info(f"[Ranking] Team order filtering active: prioritizing {home_team} vs {away_team}")
     for i, (score, v) in enumerate(similarity_scored[:5]):
         logger.info(f"  {i+1}. Score: {score:.3f} | {v.get('title', '')[:60]}")
     
@@ -629,16 +746,24 @@ def search_and_display_highlights_with_metadata(
     print(f"[YouTube Highlights Search]")
     print(f"{'='*60}")
     
-    # Extract competition
+    # Extract competition and emphasize_order
     competition = extra.get("competition")
     match_metadata = extra.get("match_metadata")
     if not competition and isinstance(match_metadata, dict):
         competition = match_metadata.get("competition")
 
+    # Get emphasize_order from parsed_query if available
+    parsed_query = extra.get("parsed_query")
+    emphasize_order = False
+    if parsed_query and isinstance(parsed_query, dict):
+        emphasize_order = parsed_query.get("emphasize_order", False)
+
     print(f"  Home Team: {home_team}")
     print(f"  Away Team: {away_team}")
     print(f"  Competition: {competition}")
     print(f"  Match Date: {match_date}")
+    if emphasize_order:
+        print(f"  Emphasize Order: True (prioritizing {home_team} vs {away_team})")
     
     # Build search query string for similarity matching
     search_query = f"{home_team} vs {away_team} highlights"
@@ -680,14 +805,17 @@ def search_and_display_highlights_with_metadata(
             )
             if channel_items:
                 print(f"[YouTube API] Found {len(channel_items)} videos from channel {chan}")
-                # Rank with similarity (with threshold check)
+                # Rank with similarity (with threshold check and team order filtering)
                 result = _rank_videos_by_similarity(
                     query=search_query,
                     match_context=context_text,
                 candidates=channel_items,
-                max_results=max_results,
+                    max_results=max_results,
                     min_similarity=0.6,  # Only use if similarity >= 0.6
                     return_scores=True,
+                home_team=home_team,
+                away_team=away_team,
+                    emphasize_order=emphasize_order,
                 )
                 validated, scored = result
                 if validated and scored:
@@ -719,6 +847,9 @@ def search_and_display_highlights_with_metadata(
                     match_context=context_text,
                     candidates=global_items,
                     max_results=max_results,
+                    home_team=home_team,
+                    away_team=away_team,
+                    emphasize_order=emphasize_order,
                 )
 
     # DDG fallback
@@ -738,6 +869,9 @@ def search_and_display_highlights_with_metadata(
                 match_context=context_text,
                 candidates=ddg_candidates,
                 max_results=max_results,
+                home_team=home_team,
+                away_team=away_team,
+                emphasize_order=emphasize_order,
             )
 
     # Final summary

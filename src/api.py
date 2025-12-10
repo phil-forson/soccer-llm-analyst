@@ -332,7 +332,7 @@ async def _process_query_core(
                 }
             }
             return
-        
+
         score_info = match_metadata.get('score', 'Not found')
         teams_info = f"{match_metadata.get('home_team', 'Unknown')} vs {match_metadata.get('away_team', 'Unknown')}"
         msg = send("web_search", f"Found match: {teams_info}. Score: {score_info}.", "complete")
@@ -360,7 +360,8 @@ async def _process_query_core(
                         away_team=away_team,
                         match_date=match_date,
                         web_summary=web_summary,
-                        match_metadata=match_metadata
+                        match_metadata=match_metadata,
+                        parsed_query=parsed,  # Pass parsed_query for team order filtering
                     )
                     highlights = _normalise_highlight_results(raw_highlights)
                     msg = send("highlights", f"Found {len(highlights)} highlight videos.", "complete")
@@ -423,8 +424,59 @@ async def query_stream_endpoint(
     """
     if request is None:
         if query is None:
-            return {"error": "Query is required"}
-        query = unquote(query)
+            error_response = {
+                "type": "result",
+                "data": {
+                    "success": False,
+                    "intent": "general",
+                    "summary": "❌ Query is required",
+                    "error": "missing_query",
+                    "match_metadata": None,
+                    "highlights": [],
+                    "sources": [],
+                    "game_analysis": None,
+                }
+            }
+            return StreamingResponse(
+                f"data: {json.dumps(error_response)}\n\ndata: [DONE]\n\n",
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "Content-Type": "text/event-stream; charset=utf-8",
+                }
+            )
+        query = unquote(query) if query else ""
+    else:
+        query = request.query
+    
+    if not query:
+        error_response = {
+            "type": "result",
+            "data": {
+                "success": False,
+                "intent": "general",
+                "summary": "❌ Query is required",
+                "error": "missing_query",
+                "match_metadata": None,
+                "highlights": [],
+                "sources": [],
+                "game_analysis": None,
+            }
+        }
+        return StreamingResponse(
+            f"data: {json.dumps(error_response)}\n\ndata: [DONE]\n\n",
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8",
+            }
+        )
+    
+    if request is None:
         request = QueryRequest(query=query, include_highlights=include_highlights)
     
     async def generate():
@@ -495,7 +547,7 @@ async def query_endpoint(request: QueryRequest):
                 sources=[],
                 game_analysis=None,
             )
-    
+        
     if result:
         return QueryResponse(**result)
     
@@ -624,7 +676,8 @@ async def analyze_match_endpoint(request: QueryRequest):
                         away_team=away_team,
                         match_date=match_date,
                         web_summary=web_summary,
-                        match_metadata=match_metadata
+                        match_metadata=match_metadata,
+                        parsed_query=parsed,  # Pass parsed_query for team order filtering
                     )
                     highlights = _normalise_highlight_results(raw_highlights)
             except Exception:
