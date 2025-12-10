@@ -37,6 +37,10 @@ COMPETITION_CHANNEL_HINTS = {
         "UC6c1z7bA__85CIWZ_jpCK-Q",  # ESPN
         "UCqZQlzSHbVJrwrn5XvzrzcA",  # NBC Sports
     ],
+    "international": [
+        "UCpcTrCXblq78GZrTUTLWeBw",  # FIFA
+        "UCooTLkxcpnTNx6vfOovfBFA",  # Fox Soccer
+    ],
 }
 
 GLOBAL_PREFERRED_CHANNEL_IDS = [
@@ -116,6 +120,8 @@ def _normalise_competition(comp: Optional[str]) -> Optional[str]:
         return "premier league"
     if "champions" in c or "ucl" in c:
         return "champions league"
+    if "international" in c or "world cup" in c or "nations league" in c:
+        return "international"
     return c
 
 
@@ -544,6 +550,7 @@ COMPETITION_BROADCASTERS = {
     "carabao cup": ["Sky Sports"],
     "europa league": ["CBS Sports Golazo", "CBS Sports", "TNT Sports"],
     "conference league": ["CBS Sports Golazo", "CBS Sports"],
+    "international": ["FIFA", "Fox Soccer", "Fox Sports"],
 }
 
 # Broadcaster name patterns to detect from title/description
@@ -565,6 +572,9 @@ BROADCASTER_PATTERNS = {
     "bein": "beIN Sports",
     "bbc": "BBC Sport",
     "goal.com": "Goal",
+    "fifa": "FIFA",
+    "fox soccer": "Fox Soccer",
+    "fox sports": "Fox Sports",
 }
 
 
