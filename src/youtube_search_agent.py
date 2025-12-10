@@ -56,7 +56,8 @@ except ImportError:
 
 # Lazy-loaded embedding model
 _embedding_model: Optional["SentenceTransformer"] = None
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# Smaller model for lower memory usage (~300MB vs ~500MB)
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L3-v2"
 
 
 def _get_embedding_model() -> "SentenceTransformer":

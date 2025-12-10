@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 MAX_RESULTS = 10
 MAX_ARTICLE_FETCH = 4
 ARTICLE_TEXT_LIMIT = 12000
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# Smaller model for lower memory usage (~300MB vs ~500MB)
+# Options: "all-MiniLM-L6-v2" (best quality), "all-MiniLM-L3-v2" (smaller)
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L3-v2"
 
 TRUSTED_SOURCES = [
     "espn.com", "bbc.com", "bbc.co.uk", "skysports.com", "goal.com",

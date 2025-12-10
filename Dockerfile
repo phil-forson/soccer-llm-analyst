@@ -16,6 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
+# Install CPU-only PyTorch first (much smaller than full PyTorch)
+# This saves ~1GB in image size and ~200MB RAM
+RUN pip install --no-cache-dir --user torch --index-url https://download.pytorch.org/whl/cpu
+
 # Install Python dependencies
 RUN pip install --no-cache-dir --user -r requirements.txt
 
@@ -24,11 +28,8 @@ FROM python:3.11-slim as production
 
 WORKDIR /app
 
-# Install runtime dependencies (ffmpeg for yt-dlp)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# Clean up apt cache
+RUN apt-get update && rm -rf /var/lib/apt/lists/* && apt-get clean
 
 # Copy installed packages from builder
 COPY --from=builder /root/.local /root/.local
@@ -41,8 +42,8 @@ COPY src/ ./src/
 COPY run_api.py .
 COPY requirements.txt .
 
-# Create directory for data persistence (ChromaDB, logs, etc.)
-RUN mkdir -p /app/data /app/logs
+# Create directory for logs
+RUN mkdir -p /app/logs
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
