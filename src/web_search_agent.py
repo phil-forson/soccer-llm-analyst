@@ -48,9 +48,9 @@ logger = logging.getLogger(__name__)
 MAX_RESULTS = 10
 MAX_ARTICLE_FETCH = 4
 ARTICLE_TEXT_LIMIT = 12000
-# Smaller model for lower memory usage (~300MB vs ~500MB)
-# Options: "all-MiniLM-L6-v2" (best quality), "all-MiniLM-L3-v2" (smaller)
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L3-v2"
+# Embedding model for semantic similarity
+# all-MiniLM-L6-v2 is a good balance of quality and size (~90MB)
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 TRUSTED_SOURCES = [
     "espn.com", "bbc.com", "bbc.co.uk", "skysports.com", "goal.com",
@@ -321,13 +321,24 @@ def search_with_rag(
     home_team = teams[0] if len(teams) > 0 else None
     away_team = teams[1] if len(teams) > 1 else None
 
-    # Bias query for match results
-    biased_query = query
-    if intent in ("match_result", "match_highlights"):
-        year = datetime.now().year
-        biased_query = f"{query} latest match result score {year} men"
-
-    print(f'[WebSearch] Query: "{biased_query}"')
+    # Build search query - use parser's optimized query if available
+    search_query = query
+    if parsed_query:
+        # Use the query parser's optimized search_query
+        search_query = parsed_query.get("search_query") or query
+        
+        # Add date context if available and not already in query
+        date_context = parsed_query.get("date_context")
+        if date_context and date_context not in search_query.lower():
+            search_query = f"{search_query} {date_context}"
+        
+        # Only add "result score" for match intents if not already present
+        if intent in ("match_result", "match_highlights"):
+            if "result" not in search_query.lower() and "score" not in search_query.lower():
+                search_query = f"{search_query} result score"
+    
+    print(f'[WebSearch] Original query: "{query}"')
+    print(f'[WebSearch] Search query: "{search_query}"')
     
     # Step 1: Web search
     all_results: List[dict] = []
@@ -335,7 +346,7 @@ def search_with_rag(
     search_sources = [None, "espn.com", "bbc.com/sport", "theguardian.com/football"]
 
     for source in search_sources:
-        results = _search_with_source(biased_query, source, max_results=6)
+        results = _search_with_source(search_query, source, max_results=6)
         for r in results:
             url = r.get("url", "")
             if not url or url in seen_urls:

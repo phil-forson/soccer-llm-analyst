@@ -56,8 +56,8 @@ except ImportError:
 
 # Lazy-loaded embedding model
 _embedding_model: Optional["SentenceTransformer"] = None
-# Smaller model for lower memory usage (~300MB vs ~500MB)
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L3-v2"
+# Embedding model for semantic similarity
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 def _get_embedding_model() -> "SentenceTransformer":
@@ -137,19 +137,31 @@ def build_search_queries(
     match_date: Optional[Union[str, datetime]] = None,
     competition: Optional[str] = None,
 ) -> List[str]:
-    """Build search queries for highlights."""
+    """Build search queries for highlights with year context."""
     dt = _safe_parse_date(match_date)
     comp_part = f" {competition}" if competition else ""
-
-    queries = [
-        f"{home_team} vs {away_team} highlights{comp_part}",
-        f"{home_team} {away_team} extended highlights{comp_part}",
-        f"{home_team} {away_team} goals{comp_part}",
-    ]
-
+    
+    # Get year - from match_date if available, otherwise current year
     if dt:
-        date_str = dt.strftime("%Y-%m-%d")
-        queries.append(f"{home_team} vs {away_team} highlights {date_str}{comp_part}")
+        year = dt.year
+    else:
+        year = datetime.now().year
+    
+    queries = [
+        # Primary queries with year
+        f"{home_team} vs {away_team} highlights {year}{comp_part}",
+        f"{home_team} {away_team} extended highlights {year}{comp_part}",
+        f"{home_team} {away_team} goals {year}{comp_part}",
+    ]
+    
+    # Add specific date query if we have one
+    if dt:
+        date_str = dt.strftime("%d %B %Y")  # e.g., "08 December 2024"
+        queries.insert(0, f"{home_team} vs {away_team} highlights {date_str}{comp_part}")
+    
+    print(f"[YouTube] Search queries built with year {year}:")
+    for i, q in enumerate(queries[:3], 1):
+        print(f"  {i}. {q}")
     
     return list(dict.fromkeys(queries))
 
@@ -474,28 +486,38 @@ def _ddg_search_highlights(
         return []
 
     dt = _safe_parse_date(match_date)
-    date_phrase = dt.strftime("%d %B %Y") if dt else ""
     comp_part = f" {competition}" if competition else ""
+    
+    # Get year - from match_date if available, otherwise current year
+    if dt:
+        year = dt.year
+        date_phrase = dt.strftime("%d %B %Y")
+    else:
+        year = datetime.now().year
+        date_phrase = ""
+    
+    print(f"  Year: {year}")
     
     # Get preferred broadcasters for this competition
     preferred_broadcasters = _get_preferred_broadcasters(competition)
     
-    # Build queries: broadcaster-specific first, then generic
+    # Build queries: broadcaster-specific first, then generic - ALL with year
     queries = []
     
-    # Priority 1: Broadcaster-specific queries
+    # Priority 1: Broadcaster-specific queries WITH YEAR
     for broadcaster in preferred_broadcasters[:2]:  # Top 2 broadcasters
-        q = f"{home_team} vs {away_team} highlights {broadcaster}"
+        q = f"{home_team} vs {away_team} highlights {broadcaster} {year}"
         if competition:
             q += f" {competition}"
         queries.append(q)
     
-    # Priority 2: Generic queries
-    base_q = f"{home_team} vs {away_team} highlights{comp_part}"
+    # Priority 2: Generic queries WITH YEAR
+    base_q = f"{home_team} vs {away_team} highlights {year}{comp_part}"
     queries.append(base_q)
     
+    # Priority 3: With full date if available
     if date_phrase:
-        queries.append(f"{base_q} {date_phrase}")
+        queries.append(f"{home_team} vs {away_team} highlights {date_phrase}{comp_part}")
 
     print(f"\n[YouTube] Search queries (in priority order):")
     for i, q in enumerate(queries, 1):
