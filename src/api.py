@@ -24,7 +24,7 @@ from .models import (
 )
 from .utils import get_openai_client, is_quota_error, extract_urls_from_text
 from .config import DEFAULT_LLM_MODEL
-from .query_parser_agent import parse_query, should_fetch_highlights, QueryIntent
+from .query_parser_agent import parse_query, should_fetch_highlights, QueryIntent, MATCH_INTENTS
 from .web_search_agent import search_with_rag
 from .youtube_search_agent import search_and_display_highlights_with_metadata
 from .game_analyst_agent import analyze_match_from_web_results
@@ -280,6 +280,20 @@ async def _process_query_core(
         intent = parsed.get("intent", "general")
         search_query = parsed.get("search_query", request.query)
         teams = parsed.get("teams", [])
+        
+        # Check if match-related queries or competition_latest queries have exactly two teams
+        if intent in MATCH_INTENTS or intent == QueryIntent.COMPETITION_LATEST.value:
+            if len(teams) != 2:
+                error_msg = "Please specify exactly two teams for match queries."
+                suggestion = "Try another query like: 'Arsenal vs Chelsea result' or 'Liverpool vs Manchester City highlights'"
+                if stream_thinking:
+                    yield send("query_parser", f"Validation failed: {error_msg}", "error")
+                yield {
+                    "type": "error",
+                    "error": "insufficient_teams",
+                    "message": f"❌ {error_msg}\n\n💡 Suggestion: {suggestion}"
+                }
+                return
         
         msg = send("query_parser", f"Query parsed. Intent: {intent}.", "complete",
                    {"intent": intent, "teams": teams})
@@ -616,6 +630,17 @@ async def analyze_match_endpoint(request: QueryRequest):
         
         search_query = parsed.get("search_query", request.query)
         intent = parsed.get("intent", "general")
+        teams = parsed.get("teams", [])
+        
+        # Check if match-related queries or competition_latest queries have exactly two teams
+        if intent in MATCH_INTENTS or intent == QueryIntent.COMPETITION_LATEST.value:
+            if len(teams) != 2:
+                error_msg = "Please specify exactly two teams for match analysis."
+                suggestion = "Try another query like: 'Arsenal vs Chelsea' or 'Liverpool vs Manchester City'"
+                return GameAnalysisResponse(
+                    success=False,
+                    error=f"{error_msg} {suggestion}"
+                )
         
         # Step 2: Web search
         try:
