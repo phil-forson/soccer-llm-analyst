@@ -140,7 +140,7 @@ def build_search_queries(
     """Build search queries for highlights with year context."""
     dt = _safe_parse_date(match_date)
     comp_part = f" {competition}" if competition else ""
-    
+
     # Get year - from match_date if available, otherwise current year
     if dt:
         year = dt.year
@@ -233,15 +233,25 @@ def _rank_videos_by_similarity(
     match_context: str,
     candidates: List[Dict[str, Any]],
     max_results: int = 5,
-) -> List[Dict[str, Any]]:
+    min_similarity: float = 0.6,
+    return_scores: bool = False,
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], List[Tuple[float, Dict[str, Any]]]]]:
     """
     Rank videos using pure semantic similarity.
     
     Uses sentence-transformers to compute cosine similarity between
     the query/context and video titles/descriptions.
+    
+    Args:
+        min_similarity: Minimum similarity score (0-1) to consider a video relevant.
+                       Videos below this threshold are filtered out.
+        return_scores: If True, also return the scored list for quality checking.
+    
+    Returns:
+        List of videos, or (videos, scored_list) if return_scores=True
     """
     if not candidates:
-        return []
+        return [] if not return_scores else ([], [])
     
     # Get semantic similarity scores
     similarity_scored = _compute_video_similarity_scores(query, match_context, candidates)
@@ -250,7 +260,20 @@ def _rank_videos_by_similarity(
     for i, (score, v) in enumerate(similarity_scored[:5]):
         logger.info(f"  {i+1}. Score: {score:.3f} | {v.get('title', '')[:60]}")
     
-    return [item for _, item in similarity_scored[:max_results]]
+    # Filter by minimum similarity threshold
+    filtered = [(score, item) for score, item in similarity_scored if score >= min_similarity]
+    
+    if not filtered:
+        logger.warning(f"[Ranking] No videos met minimum similarity threshold ({min_similarity})")
+        # Return top result even if below threshold, but log it
+        if similarity_scored:
+            top_score, top_item = similarity_scored[0]
+            logger.warning(f"[Ranking] Best match only scored {top_score:.3f}, below threshold")
+            result = [top_item]  # Return at least one result
+            return (result, similarity_scored[:1]) if return_scores else result
+    
+    result = [item for _, item in filtered[:max_results]]
+    return (result, filtered[:max_results]) if return_scores else result
 
 
 # =============================================================================
@@ -657,17 +680,27 @@ def search_and_display_highlights_with_metadata(
             )
             if channel_items:
                 print(f"[YouTube API] Found {len(channel_items)} videos from channel {chan}")
-                # Rank with similarity
-                validated = _rank_videos_by_similarity(
+                # Rank with similarity (with threshold check)
+                result = _rank_videos_by_similarity(
                     query=search_query,
                     match_context=context_text,
-                    candidates=channel_items,
-                    max_results=max_results,
+                candidates=channel_items,
+                max_results=max_results,
+                    min_similarity=0.6,  # Only use if similarity >= 0.6
+                    return_scores=True,
                 )
-                if validated:
-                    candidates = validated
-                    print(f"[YouTube API] Using {len(candidates)} videos from preferred channel")
-                    break
+                validated, scored = result
+                if validated and scored:
+                    top_score = scored[0][0]
+                    # Only use if top result meets quality threshold
+                    if top_score >= 0.6:
+                        candidates = validated
+                        print(f"[YouTube API] Using {len(candidates)} videos from preferred channel {chan} (top score: {top_score:.3f})")
+                        break
+                    else:
+                        print(f"[YouTube API] Top result from {chan} scored {top_score:.3f} (below threshold), trying next channel...")
+                else:
+                    print(f"[YouTube API] No videos from {chan} met similarity threshold")
             else:
                 print(f"[YouTube API] No videos from channel {chan}")
 

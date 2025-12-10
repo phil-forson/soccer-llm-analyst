@@ -221,7 +221,7 @@ def _extract_target_date(date_context: Optional[str]) -> Optional[Dict[str, Opti
     """
     if not date_context:
         return None
-    
+
     try:
         # Use datefinder to extract dates
         matches = list(datefinder.find_dates(date_context, strict=False))
@@ -248,7 +248,7 @@ def _extract_target_date(date_context: Optional[str]) -> Optional[Dict[str, Opti
             return {'year': year, 'month': None, 'day': None}
     except Exception as e:
         print(f"[DateExtraction] Regex fallback also failed: {e}")
-    
+
     return None
 
 
@@ -256,10 +256,86 @@ def _extract_target_date(date_context: Optional[str]) -> Optional[Dict[str, Opti
 # Semantic Similarity Ranking
 # =============================================================================
 
+# Team name aliases/nicknames mapping
+TEAM_ALIASES = {
+    "tottenham": ["spurs", "tottenham hotspur", "tottenham fc"],
+    "tottenham hotspur": ["spurs", "tottenham", "tottenham fc"],
+    "manchester united": ["man united", "man u", "united", "manchester utd"],
+    "manchester city": ["man city", "city", "mancity"],
+    "arsenal": ["gunners", "arsenal fc"],
+    "liverpool": ["liverpool fc", "the reds"],
+    "chelsea": ["chelsea fc", "the blues"],
+    "manchester": ["man united", "man city"],  # Ambiguous, but try both
+}
+
+def _get_team_variations(team_name: str) -> List[str]:
+    """Get all variations/aliases for a team name."""
+    if not team_name:
+        return []
+    
+    team_lower = team_name.lower()
+    variations = [team_lower]
+    
+    # Add aliases if team is in mapping
+    if team_lower in TEAM_ALIASES:
+        variations.extend(TEAM_ALIASES[team_lower])
+    
+    # Also check if any alias maps to this team
+    for alias_team, aliases in TEAM_ALIASES.items():
+        if team_lower in aliases:
+            variations.append(alias_team)
+            variations.extend(aliases)
+    
+    return list(set(variations))  # Remove duplicates
+
+
+def _check_team_order_in_text(text: str, home_team: Optional[str], away_team: Optional[str]) -> bool:
+    """
+    Check if text contains teams in the expected order (home vs away).
+    
+    Returns True if home_team appears before away_team in the text.
+    Handles team name variations and aliases (e.g., "Tottenham" matches "Spurs", "Tottenham Hotspur").
+    """
+    if not home_team or not away_team:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Get all variations for both teams
+    home_variations = _get_team_variations(home_team)
+    away_variations = _get_team_variations(away_team)
+    
+    # Find positions for any variation of each team
+    home_pos = -1
+    away_pos = -1
+    
+    for variation in home_variations:
+        pos = text_lower.find(variation)
+        if pos != -1:
+            if home_pos == -1 or pos < home_pos:
+                home_pos = pos
+    
+    for variation in away_variations:
+        pos = text_lower.find(variation)
+        if pos != -1:
+            if away_pos == -1 or pos < away_pos:
+                away_pos = pos
+    
+    # Both teams must be present
+    if home_pos == -1 or away_pos == -1:
+        return False
+    
+    # Home team should appear before away team
+    return home_pos < away_pos
+
+
 def _compute_similarity_scores(
     query: str,
     results: List[dict],
     target_date: Optional[Dict[str, Optional[int]]] = None,
+    home_team: Optional[str] = None,
+    away_team: Optional[str] = None,
+    emphasize_order: bool = False,
 ) -> List[Tuple[float, dict]]:
     """
     Compute cosine similarity between query and each result.
@@ -269,6 +345,10 @@ def _compute_similarity_scores(
     - Month+year match: +0.15 boost
     - Year match only: +0.1 boost
     - No match: -0.3 penalty
+    
+    If emphasize_order is True and home_team/away_team are provided:
+    - Results matching team order (home before away): +0.2 boost
+    - Results with teams in wrong order: -0.25 penalty
     
     Returns list of (similarity_score, result) tuples, sorted by score descending.
     """
@@ -348,6 +428,33 @@ def _compute_similarity_scores(
                         # But don't go below 0.1 to avoid completely removing them
                         similarities[i] = max(0.1, sim - 0.3)
         
+        # Apply team order filtering if emphasize_order is True
+        if emphasize_order and home_team and away_team:
+            for i, (sim, r) in enumerate(zip(similarities, results)):
+                result_text = f"{r.get('title', '')} {r.get('snippet', '')} {r.get('page_content', '')[:500]}"
+                matches_order = _check_team_order_in_text(result_text, home_team, away_team)
+                text_lower = result_text.lower()
+                
+                # Check if both teams are present (using variations/aliases)
+                home_variations = _get_team_variations(home_team)
+                away_variations = _get_team_variations(away_team)
+                has_home = any(var in text_lower for var in home_variations)
+                has_away = any(var in text_lower for var in away_variations)
+                has_both_teams = has_home and has_away
+                
+                if matches_order:
+                    # Boost: results matching team order get +0.2 boost (increased from 0.1)
+                    old_score = similarities[i]
+                    similarities[i] = min(1.0, sim + 0.2)
+                    if i < 5:  # Log top 5 results
+                        print(f"[TeamOrder] Result {i+1}: '{r.get('title', '')[:50]}' - ORDER MATCH: {old_score:.3f} → {similarities[i]:.3f} (+0.2)")
+                elif has_both_teams:
+                    # Penalty: teams present but in wrong order -0.25 penalty (increased from 0.15)
+                    old_score = similarities[i]
+                    similarities[i] = max(0.1, sim - 0.25)
+                    if i < 5:  # Log top 5 results
+                        print(f"[TeamOrder] Result {i+1}: '{r.get('title', '')[:50]}' - WRONG ORDER: {old_score:.3f} → {similarities[i]:.3f} (-0.25)")
+        
         # Pair scores with results
         scored_results = [(float(sim), r) for sim, r in zip(similarities, results)]
         
@@ -362,6 +469,8 @@ def _compute_similarity_scores(
             if target_date.get('day'):
                 date_str = f"{target_date['day']}/{date_str}"
             print(f"[Similarity] Date filtering: prioritizing {date_str}")
+        if emphasize_order and home_team and away_team:
+            print(f"[Similarity] Team order filtering: prioritizing {home_team} vs {away_team}")
         for i, (score, r) in enumerate(scored_results[:3]):
             print(f"  {i+1}. Score: {score:.3f} | {r.get('title', 'No title')[:50]}")
         
@@ -376,6 +485,9 @@ def _rank_by_similarity(
     query: str,
     results: List[dict],
     target_date: Optional[Dict[str, Optional[int]]] = None,
+    home_team: Optional[str] = None,
+    away_team: Optional[str] = None,
+    emphasize_order: bool = False,
 ) -> List[dict]:
     """
     Rank results using pure semantic similarity.
@@ -389,8 +501,14 @@ def _rank_by_similarity(
     if not results:
         return []
 
-    # Get semantic similarity scores (with date filtering if target_date provided)
-    similarity_scored = _compute_similarity_scores(query, results, target_date=target_date)
+    # Get semantic similarity scores (with date and team order filtering if provided)
+    similarity_scored = _compute_similarity_scores(
+        query, results, 
+        target_date=target_date,
+        home_team=home_team,
+        away_team=away_team,
+        emphasize_order=emphasize_order,
+    )
     
     print(f"[Ranking] Ranked {len(results)} results by semantic similarity")
     if target_date:
@@ -400,6 +518,8 @@ def _rank_by_similarity(
         if target_date.get('day'):
             date_str = f"{target_date['day']}/{date_str}"
         print(f"[Ranking] Date filtering active: prioritizing {date_str}")
+    if emphasize_order and home_team and away_team:
+        print(f"[Ranking] Team order filtering active: prioritizing {home_team} vs {away_team}")
     for i, (score, r) in enumerate(similarity_scored[:5]):
         print(f"  {i+1}. Score: {score:.3f} | {r.get('title', 'No title')[:60]}")
     
@@ -519,9 +639,14 @@ def search_with_rag(
             "match_date": None, "score": None,
             "competition": parsed_query.get("competition") if parsed_query else None,
             "key_moments": [], "man_of_the_match": None, "match_summary": None,
-            "no_match_found": True,
         }
-        return f"❌ No results found for: {original_query}", metadata
+        # Only set no_match_found for match-related intents
+        if intent in ("match_result", "match_highlights"):
+            metadata["no_match_found"] = True
+            return f"❌ No results found for: {original_query}", metadata
+        else:
+            # For non-match intents, just return a helpful message
+            return f"❌ No results found for: {original_query}", metadata
     
     # Step 2: Fetch full articles from trusted sources
     _enrich_results_with_page_content(all_results)
@@ -558,11 +683,14 @@ def search_with_rag(
                 date_str = f"{target_date['day']}/{date_str}"
             print(f"[WebSearch] Target date for filtering: {date_str}")
     
-    # Step 4: Rank by semantic similarity (with date filtering if applicable)
+    # Step 4: Rank by semantic similarity (with date and team order filtering if applicable)
     ranked_results = _rank_by_similarity(
         query=original_query,
         results=all_results,
         target_date=target_date,
+        home_team=home_team,
+        away_team=away_team,
+        emphasize_order=emphasize_order,
     )
     
     # Step 5: Build context from top results
@@ -575,9 +703,14 @@ def search_with_rag(
             "match_date": None, "score": None,
             "competition": parsed_query.get("competition") if parsed_query else None,
             "key_moments": [], "man_of_the_match": None, "match_summary": None,
-            "no_match_found": True,
         }
-        return f"❌ Could not find reliable information for: {original_query}", metadata
+        # Only set no_match_found for match-related intents
+        if intent in ("match_result", "match_highlights"):
+            metadata["no_match_found"] = True
+            return f"❌ Could not find reliable information for: {original_query}", metadata
+        else:
+            # For non-match intents, just return a helpful message
+            return f"❌ Could not find reliable information for: {original_query}", metadata
 
     context = "\n\n".join(
         f"[Source: {c.get('title','Unknown')}]\n{c['text']}" for c in relevant_chunks
@@ -585,6 +718,22 @@ def search_with_rag(
 
     # Step 6: LLM extracts answer AND metadata in one call
     client = get_openai_client()
+    
+    # Build context with ranking information
+    context_parts = []
+    for idx, c in enumerate(relevant_chunks, 1):
+        context_parts.append(f"[Result #{idx} - Ranked {idx}]")
+        context_parts.append(f"Title: {c.get('title','Unknown')}")
+        context_parts.append(f"Content: {c.get('text','')}")
+        context_parts.append(f"Source: {c.get('source','')}")
+        context_parts.append("")  # Empty line between results
+    
+    context = "\n".join(context_parts)
+    
+    # Add team order hint if emphasize_order is set
+    team_order_hint = ""
+    if parsed_query and parsed_query.get("emphasize_order") and home_team and away_team:
+        team_order_hint = f"\n\nIMPORTANT: The user's query specified team order as '{home_team} vs {away_team}'. Prioritize results that match this team order."
     
     system_prompt = """You are a football/soccer information assistant.
 
@@ -603,22 +752,25 @@ You must respond with valid JSON containing:
 
 STRICT RULES:
 1. Only use information from the provided context.
-2. Extract ALL available information from the context, even if it's not the exact match requested.
-3. If the exact match isn't found, extract the closest match or most relevant information available.
-4. For teams: Extract team names even if they appear in different order or context.
-5. For dates: Extract dates in YYYY-MM-DD format. If only year/month is available, use that.
-6. For scores: Look for score patterns like "2-1", "3-0", "won 2-1", "beat 3-0", etc.
-7. If information is truly not found after careful search, use null.
-8. Do NOT guess or invent scores, dates, or player names.
-9. The "answer" field should be a helpful, natural response to the user, explaining what was found.
-10. Output ONLY valid JSON, no markdown or extra text."""
+2. Results are ranked by relevance - Result #1 is most relevant, Result #2 is second most relevant, etc.
+3. PRIORITIZE higher-ranked results (Result #1, #2, #3) over lower-ranked ones.
+4. If multiple matches are found, prefer the one from the highest-ranked result.
+5. Extract ALL available information from the context, even if it's not the exact match requested.
+6. If the exact match isn't found, extract the closest match from the HIGHEST-RANKED results.
+7. For teams: Extract team names. If team order was specified in the query, prioritize matches that respect that order.
+8. For dates: Extract dates in YYYY-MM-DD format. If only year/month is available, use that.
+9. For scores: Look for score patterns like "2-1", "3-0", "won 2-1", "beat 3-0", etc.
+10. If information is truly not found after careful search, use null.
+11. Do NOT guess or invent scores, dates, or player names.
+12. The "answer" field should be a helpful, natural response to the user, explaining what was found.
+13. Output ONLY valid JSON, no markdown or extra text."""
 
-    user_message = f"""User question: {original_query}
+    user_message = f"""User question: {original_query}{team_order_hint}
 
-Context:
+Context (results ranked by relevance, #1 is most relevant):
 {context}
 
-Extract the answer and match metadata from the context above. Return JSON only."""
+Extract the answer and match metadata from the context above. Prioritize information from higher-ranked results (Result #1, #2, #3). Return JSON only."""
 
     try:
         resp = client.chat.completions.create(
@@ -683,10 +835,15 @@ Extract the answer and match metadata from the context above. Return JSON only."
             "key_moments": [], "man_of_the_match": None, "match_summary": None,
         }
     
-    # Determine if match was found
-    if not (metadata.get("score") or metadata.get("match_date") or metadata.get("key_moments")):
-        metadata["no_match_found"] = True
+    # Determine if match was found - only for match-related intents
+    if intent in ("match_result", "match_highlights"):
+        if not (metadata.get("score") or metadata.get("match_date") or metadata.get("key_moments")):
+            metadata["no_match_found"] = True
+        else:
+            metadata["no_match_found"] = False
     else:
+        # For non-match intents, don't set no_match_found
+        # They should just return the answer with sources
         metadata["no_match_found"] = False
 
     # Append sources
