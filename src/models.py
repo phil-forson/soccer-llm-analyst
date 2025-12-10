@@ -17,6 +17,14 @@ class QueryRequest(BaseModel):
     """Request model for query endpoint."""
     query: str
     include_highlights: Optional[bool] = None  # Auto-detect if not provided
+    
+    # When True, the order teams appear in the query matters
+    # First team mentioned = home team, second = away team
+    emphasize_order: Optional[bool] = False
+    
+    # Gender preference - defaults to "men" for men's football
+    # Options: "men", "women", "any"
+    gender: Optional[str] = "men"
 
 
 # =============================================================================

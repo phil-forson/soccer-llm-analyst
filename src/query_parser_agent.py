@@ -461,6 +461,7 @@ def _validate_and_enhance(parsed: Dict[str, Any], raw_query: str) -> Dict[str, A
         "search_query": search_query,
         "is_relevant": is_valid and parsed.get("is_relevant", True),
         "validation_error": validation_error or parsed.get("validation_error"),
+        "emphasize_order": parsed.get("emphasize_order", False),  # Preserve this flag!
     }
     
     return result
@@ -470,7 +471,7 @@ def _validate_and_enhance(parsed: Dict[str, Any], raw_query: str) -> Dict[str, A
 # Public API
 # =============================================================================
 
-def parse_query(user_query: str) -> Dict[str, Any]:
+def parse_query(user_query: str, emphasize_order: bool = False) -> Dict[str, Any]:
     """
     Main entry point for query parsing.
     
@@ -480,13 +481,21 @@ def parse_query(user_query: str) -> Dict[str, Any]:
     - "Who won the Champions League final?"
     - "Arsenal vs Chelsea highlights"
     
+    Args:
+        user_query: The user's natural language query
+        emphasize_order: If True, the order teams appear matters.
+                        First team = home, second team = away.
+    
     Returns a dict with:
       - raw_query, intent, teams, competition, date_context
       - search_query, is_relevant, validation_error
       - home_team, away_team (if applicable)
       - is_most_recent, specific_match_identifier
+      - emphasize_order: Whether team order should be preserved
     """
     raw = user_query.strip()
+    
+    print(f"[QueryParser] Emphasize team order: {emphasize_order}")
     
     # 1) Call LLM for intelligent parsing
     llm_data = _call_llm_for_parse(raw)
@@ -511,12 +520,14 @@ def parse_query(user_query: str) -> Dict[str, Any]:
             "search_query": raw,
             "is_relevant": True,
             "validation_error": None,
+            "emphasize_order": emphasize_order,
         }
         result = _validate_and_enhance(base, raw)
         print("[QueryParser] Parsed (heuristic):", result)
         return result
     
     # 3) Validate and enhance LLM output
+    llm_data["emphasize_order"] = emphasize_order
     result = _validate_and_enhance(llm_data, raw)
     print("[QueryParser] Parsed query:", result)
     return result

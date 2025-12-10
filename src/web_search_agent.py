@@ -17,6 +17,7 @@ from typing import Optional, Tuple, List, Dict, Any
 
 import requests
 from requests.exceptions import RequestException
+import datefinder
 
 from .utils import get_openai_client, domain_from_url
 from .config import DEFAULT_LLM_MODEL
@@ -178,7 +179,77 @@ def _enrich_results_with_page_content(results: List[dict]) -> None:
         main_text = _extract_main_text_from_html(html)
         if main_text:
             r["page_content"] = main_text
-            fetched += 1
+        fetched += 1
+
+
+# =============================================================================
+# Date/Year Extraction & Filtering
+# =============================================================================
+
+def _extract_dates_from_text(text: str) -> List[datetime]:
+    """
+    Extract all dates from text using datefinder.
+    
+    Returns list of datetime objects found.
+    """
+    if not text:
+        return []
+    
+    try:
+        # Use datefinder to extract dates
+        matches = list(datefinder.find_dates(text, strict=False))
+        dates = [d for d in matches if d]
+        return dates
+    except Exception as e:
+        print(f"[DateExtraction] Error extracting dates: {e}")
+        return []
+
+
+def _extract_target_date(date_context: Optional[str]) -> Optional[Dict[str, Optional[int]]]:
+    """
+    Extract target date information (year, month, day) from date_context using datefinder.
+    
+    Returns dict with 'year', 'month', 'day' keys, or None if no date found.
+    
+    Examples:
+    - "2023 season" -> {'year': 2023, 'month': None, 'day': None} (regex fallback)
+    - "January 2023" -> {'year': 2023, 'month': 1, 'day': None}
+    - "2023" -> {'year': 2023, 'month': None, 'day': None} (regex fallback)
+    - "last year" -> None (relative, can't extract)
+    - "December 8, 2024" -> {'year': 2024, 'month': 12, 'day': 8}
+    - "Jan 18, 2023" -> {'year': 2023, 'month': 1, 'day': 18}
+    """
+    if not date_context:
+        return None
+    
+    try:
+        # Use datefinder to extract dates
+        matches = list(datefinder.find_dates(date_context, strict=False))
+        
+        if matches:
+            # Use the most specific date found (prefer later dates if multiple)
+            date_obj = max(matches, key=lambda d: (d.year, d.month if d.month else 0, d.day if d.day else 0))
+            
+            return {
+                'year': date_obj.year,
+                'month': date_obj.month if hasattr(date_obj, 'month') else None,
+                'day': date_obj.day if hasattr(date_obj, 'day') else None,
+            }
+    except Exception as e:
+        print(f"[DateExtraction] Error extracting target date: {e}")
+    
+    # Fallback to regex if datefinder found nothing or failed
+    # This handles cases like "2023 season" or just "2023"
+    try:
+        year_pattern = r'\b(19\d{2}|20\d{2}|2100)\b'
+        matches = re.findall(year_pattern, date_context)
+        if matches:
+            year = max(int(y) for y in matches)
+            return {'year': year, 'month': None, 'day': None}
+    except Exception as e:
+        print(f"[DateExtraction] Regex fallback also failed: {e}")
+    
+    return None
 
 
 # =============================================================================
@@ -188,9 +259,16 @@ def _enrich_results_with_page_content(results: List[dict]) -> None:
 def _compute_similarity_scores(
     query: str,
     results: List[dict],
+    target_date: Optional[Dict[str, Optional[int]]] = None,
 ) -> List[Tuple[float, dict]]:
     """
     Compute cosine similarity between query and each result.
+    
+    If target_date is provided, applies date-based filtering:
+    - Full date match (year+month+day): +0.2 boost
+    - Month+year match: +0.15 boost
+    - Year match only: +0.1 boost
+    - No match: -0.3 penalty
     
     Returns list of (similarity_score, result) tuples, sorted by score descending.
     """
@@ -228,6 +306,48 @@ def _compute_similarity_scores(
         # Dot product gives cosine similarity for normalized vectors
         similarities = np.dot(result_norms, query_norm)
         
+        # Apply date filtering if target_date is specified
+        if target_date is not None:
+            target_year = target_date.get('year')
+            target_month = target_date.get('month')
+            target_day = target_date.get('day')
+            
+            for i, (sim, r) in enumerate(zip(similarities, results)):
+                # Extract dates from result
+                result_text = f"{r.get('title', '')} {r.get('snippet', '')} {r.get('page_content', '')[:500]}"
+                result_dates = _extract_dates_from_text(result_text)
+                
+                if result_dates and target_year:
+                    # Check for date matches
+                    match_found = False
+                    boost = 0.0
+                    
+                    for result_date in result_dates:
+                        # Check full date match (year + month + day)
+                        if (result_date.year == target_year and
+                            target_month and result_date.month == target_month and
+                            target_day and result_date.day == target_day):
+                            boost = 0.2  # Strongest boost for exact date match
+                            match_found = True
+                            break
+                        # Check month+year match
+                        elif (result_date.year == target_year and
+                              target_month and result_date.month == target_month):
+                            boost = max(boost, 0.15)  # Good boost for month+year match
+                            match_found = True
+                        # Check year match only
+                        elif result_date.year == target_year:
+                            boost = max(boost, 0.1)  # Basic boost for year match
+                            match_found = True
+                    
+                    if match_found:
+                        # Apply boost
+                        similarities[i] = min(1.0, sim + boost)
+                    else:
+                        # Penalty: results with different dates get -0.3 penalty
+                        # But don't go below 0.1 to avoid completely removing them
+                        similarities[i] = max(0.1, sim - 0.3)
+        
         # Pair scores with results
         scored_results = [(float(sim), r) for sim, r in zip(similarities, results)]
         
@@ -235,6 +355,13 @@ def _compute_similarity_scores(
         scored_results.sort(key=lambda x: x[0], reverse=True)
         
         print(f"[Similarity] Ranked {len(results)} results by semantic similarity")
+        if target_date:
+            date_str = f"{target_date.get('year', '?')}"
+            if target_date.get('month'):
+                date_str = f"{target_date['month']}/{date_str}"
+            if target_date.get('day'):
+                date_str = f"{target_date['day']}/{date_str}"
+            print(f"[Similarity] Date filtering: prioritizing {date_str}")
         for i, (score, r) in enumerate(scored_results[:3]):
             print(f"  {i+1}. Score: {score:.3f} | {r.get('title', 'No title')[:50]}")
         
@@ -248,20 +375,31 @@ def _compute_similarity_scores(
 def _rank_by_similarity(
     query: str,
     results: List[dict],
+    target_date: Optional[Dict[str, Optional[int]]] = None,
 ) -> List[dict]:
     """
     Rank results using pure semantic similarity.
     
     Uses sentence-transformers to compute cosine similarity between
     the query and each result's content.
+    
+    If target_date is provided, applies date-based filtering to prioritize
+    results matching the date (year, month, day).
     """
     if not results:
         return []
 
-    # Get semantic similarity scores
-    similarity_scored = _compute_similarity_scores(query, results)
+    # Get semantic similarity scores (with date filtering if target_date provided)
+    similarity_scored = _compute_similarity_scores(query, results, target_date=target_date)
     
     print(f"[Ranking] Ranked {len(results)} results by semantic similarity")
+    if target_date:
+        date_str = f"{target_date.get('year', '?')}"
+        if target_date.get('month'):
+            date_str = f"{target_date['month']}/{date_str}"
+        if target_date.get('day'):
+            date_str = f"{target_date['day']}/{date_str}"
+        print(f"[Ranking] Date filtering active: prioritizing {date_str}")
     for i, (score, r) in enumerate(similarity_scored[:5]):
         print(f"  {i+1}. Score: {score:.3f} | {r.get('title', 'No title')[:60]}")
     
@@ -300,6 +438,7 @@ def search_with_rag(
     original_query: str,
     parsed_query: Optional[dict] = None,
     summary_focus: Optional[str] = None,
+    gender: str = "men",  # "men", "women", "any"
 ) -> tuple[str, dict]:
     """
     Web search pipeline with semantic similarity ranking.
@@ -317,9 +456,18 @@ def search_with_rag(
     print("[WebSearch] Starting search pipeline")
     print(f"{'='*60}")
 
+    # Get teams from parsed query
     teams = (parsed_query.get("teams") if parsed_query else []) or []
+    emphasize_order = parsed_query.get("emphasize_order", False) if parsed_query else False
+    
+    # When emphasize_order is True, use teams in the exact order from the query
+    # First team = home, second team = away (as they appear in user's query)
     home_team = teams[0] if len(teams) > 0 else None
     away_team = teams[1] if len(teams) > 1 else None
+
+    print(f"[WebSearch] Teams: {home_team} vs {away_team}")
+    print(f"[WebSearch] Emphasize order: {emphasize_order}")
+    print(f"[WebSearch] Gender preference: {gender}")
 
     # Build search query - use parser's optimized query if available
     search_query = query
@@ -336,6 +484,13 @@ def search_with_rag(
         if intent in ("match_result", "match_highlights"):
             if "result" not in search_query.lower() and "score" not in search_query.lower():
                 search_query = f"{search_query} result score"
+    
+    # Add gender bias to search query
+    if gender == "men" and "women" not in search_query.lower():
+        search_query = f"{search_query} men"
+    elif gender == "women" and "women" not in search_query.lower():
+        search_query = f"{search_query} women"
+    # gender == "any" - don't add anything
     
     print(f'[WebSearch] Original query: "{query}"')
     print(f'[WebSearch] Search query: "{search_query}"')
@@ -371,13 +526,46 @@ def search_with_rag(
     # Step 2: Fetch full articles from trusted sources
     _enrich_results_with_page_content(all_results)
     
-    # Step 3: Rank by semantic similarity
+    # Step 3: Extract target date (year, month, day) for filtering
+    # Try date_context first, but fallback to raw_query if date_context is too generic
+    target_date = None
+    if parsed_query:
+        date_context = parsed_query.get("date_context")
+        raw_query = parsed_query.get("raw_query", original_query)
+        
+        # Extract from date_context
+        target_date = _extract_target_date(date_context)
+        
+        # If date_context is too generic (e.g., "2023 season") and doesn't have month/day,
+        # try extracting from raw_query to get more specific date info
+        if target_date and not target_date.get('month') and not target_date.get('day'):
+            # Check if raw_query has more specific date info
+            raw_date = _extract_target_date(raw_query)
+            if raw_date and (raw_date.get('month') or raw_date.get('day')):
+                # Use the more specific date from raw_query
+                target_date = raw_date
+                print(f"[WebSearch] Using more specific date from raw query")
+        
+        # If no date found in date_context, try raw_query
+        if not target_date:
+            target_date = _extract_target_date(raw_query)
+        
+        if target_date:
+            date_str = f"{target_date.get('year', '?')}"
+            if target_date.get('month'):
+                date_str = f"{target_date['month']}/{date_str}"
+            if target_date.get('day'):
+                date_str = f"{target_date['day']}/{date_str}"
+            print(f"[WebSearch] Target date for filtering: {date_str}")
+    
+    # Step 4: Rank by semantic similarity (with date filtering if applicable)
     ranked_results = _rank_by_similarity(
         query=original_query,
         results=all_results,
+        target_date=target_date,
     )
     
-    # Step 4: Build context from top results
+    # Step 5: Build context from top results
     relevant_chunks = _build_context_from_results(ranked_results, k=5)
     print(f"[WebSearch] Using top {len(relevant_chunks)} results as context")
     
@@ -395,7 +583,7 @@ def search_with_rag(
         f"[Source: {c.get('title','Unknown')}]\n{c['text']}" for c in relevant_chunks
     )
 
-    # Step 5: LLM extracts answer AND metadata in one call
+    # Step 6: LLM extracts answer AND metadata in one call
     client = get_openai_client()
     
     system_prompt = """You are a football/soccer information assistant.
@@ -415,10 +603,15 @@ You must respond with valid JSON containing:
 
 STRICT RULES:
 1. Only use information from the provided context.
-2. If information is not found, use null.
-3. Do NOT guess or invent scores, dates, or player names.
-4. The "answer" field should be a helpful, natural response to the user.
-5. Output ONLY valid JSON, no markdown or extra text."""
+2. Extract ALL available information from the context, even if it's not the exact match requested.
+3. If the exact match isn't found, extract the closest match or most relevant information available.
+4. For teams: Extract team names even if they appear in different order or context.
+5. For dates: Extract dates in YYYY-MM-DD format. If only year/month is available, use that.
+6. For scores: Look for score patterns like "2-1", "3-0", "won 2-1", "beat 3-0", etc.
+7. If information is truly not found after careful search, use null.
+8. Do NOT guess or invent scores, dates, or player names.
+9. The "answer" field should be a helpful, natural response to the user, explaining what was found.
+10. Output ONLY valid JSON, no markdown or extra text."""
 
     user_message = f"""User question: {original_query}
 
@@ -459,7 +652,15 @@ Extract the answer and match metadata from the context above. Return JSON only."
             "match_summary": llm_data.get("match_summary"),
         }
         
-        print(f"[WebSearch] LLM extracted - Score: {metadata.get('score')}, Teams: {metadata.get('home_team')} vs {metadata.get('away_team')}")
+        score = metadata.get('score')
+        home = metadata.get('home_team')
+        away = metadata.get('away_team')
+        match_date = metadata.get('match_date')
+        print(f"[WebSearch] LLM extracted - Score: {score}, Teams: {home} vs {away}, Date: {match_date}")
+        
+        # Warn if critical info is missing
+        if not score and not home and not away:
+            print(f"[WebSearch] WARNING: LLM extracted no match information. Answer: {answer_text[:100] if answer_text else 'None'}")
         
     except json.JSONDecodeError as e:
         print(f"[WebSearch] JSON parse error: {e}")

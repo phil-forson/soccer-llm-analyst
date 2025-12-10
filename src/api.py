@@ -251,7 +251,10 @@ async def _process_query_core(
             yield msg
         
         try:
-            parsed = parse_query(request.query)
+            parsed = parse_query(
+                request.query,
+                emphasize_order=request.emphasize_order or False
+            )
         except Exception as e:
             if is_quota_error(e):
                 error_msg = "Our AI engine has run out of credits. Please try again later."
@@ -297,7 +300,8 @@ async def _process_query_core(
                 query=search_query,
                 intent=intent,
                 original_query=request.query,
-                parsed_query=parsed
+                parsed_query=parsed,
+                gender=request.gender or "men",
             )
         except Exception as e:
             if is_quota_error(e):
@@ -420,8 +424,8 @@ async def query_stream_endpoint(
     if request is None:
         if query is None:
             return {"error": "Query is required"}
-    query = unquote(query)
-    request = QueryRequest(query=query, include_highlights=include_highlights)
+        query = unquote(query)
+        request = QueryRequest(query=query, include_highlights=include_highlights)
     
     async def generate():
         try:
@@ -491,7 +495,7 @@ async def query_endpoint(request: QueryRequest):
                 sources=[],
                 game_analysis=None,
             )
-        
+    
     if result:
         return QueryResponse(**result)
     
@@ -539,7 +543,10 @@ async def analyze_match_endpoint(request: QueryRequest):
     try:
         # Step 1: Parse query
         try:
-            parsed = parse_query(request.query)
+            parsed = parse_query(
+                request.query,
+                emphasize_order=request.emphasize_order or False
+            )
         except Exception as e:
             if is_quota_error(e):
                 return GameAnalysisResponse(
@@ -564,7 +571,8 @@ async def analyze_match_endpoint(request: QueryRequest):
                 query=search_query,
                 intent=intent,
                 original_query=request.query,
-                parsed_query=parsed
+                parsed_query=parsed,
+                gender=request.gender or "men",
             )
         except Exception as e:
             if is_quota_error(e):
